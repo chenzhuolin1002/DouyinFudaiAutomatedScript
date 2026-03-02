@@ -115,6 +115,10 @@ TASK_UNFINISHED_KEYWORDS = [
 
 TASK_ACTION_TEXT_KEYWORDS = [
     "一键发表评论",
+    "加入粉丝团",
+    "去加入粉丝团",
+    "加入粉丝",
+    "去加入粉丝",
     "一键参与",
     "去完成",
     "去参与",
@@ -319,6 +323,36 @@ def ocr_candidates(driver: webdriver.Remote, ocr_engine: RapidOCR, keywords: Ite
     return hits
 
 
+def ocr_texts(driver: webdriver.Remote, ocr_engine: RapidOCR, min_score: float = 0.45) -> list[str]:
+    image = screenshot_np_safe(driver)
+    result, _ = ocr_engine(image)
+    if not result:
+        return []
+    texts: list[str] = []
+    for item in result:
+        _, text, score = item
+        try:
+            s = float(score)
+        except Exception:
+            s = 0.0
+        t = str(text).strip() if text is not None else ""
+        if t and s >= min_score:
+            texts.append(t)
+    return texts
+
+
+def unique_texts(texts: list[str]) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for t in texts:
+        s = (t or "").strip()
+        if not s or s in seen:
+            continue
+        seen.add(s)
+        out.append(s)
+    return out
+
+
 def contains_success(driver: webdriver.Remote, ocr_engine: Optional[RapidOCR]) -> bool:
     native = native_candidates(driver, SUCCESS_KEYWORDS)
     native = [h for h in native if _is_valid_success_text(h.text)]
@@ -331,7 +365,7 @@ def contains_success(driver: webdriver.Remote, ocr_engine: Optional[RapidOCR]) -
     return bool(ocr_hits)
 
 
-def visible_texts(driver: webdriver.Remote) -> list[str]:
+def visible_texts_raw(driver: webdriver.Remote) -> list[str]:
     texts: list[str] = []
     elements = driver.find_elements(
         AppiumBy.IOS_PREDICATE,
@@ -339,7 +373,12 @@ def visible_texts(driver: webdriver.Remote) -> list[str]:
     )
     for el in elements:
         try:
-            t = (el.get_attribute("label") or el.get_attribute("name") or "").strip()
+            t = (
+                el.get_attribute("label")
+                or el.get_attribute("name")
+                or el.get_attribute("value")
+                or ""
+            ).strip()
         except Exception:
             t = ""
         if t:
@@ -347,25 +386,131 @@ def visible_texts(driver: webdriver.Remote) -> list[str]:
     return texts
 
 
-def parse_countdown_seconds(texts: list[str]) -> Optional[int]:
-    best: Optional[int] = None
+def visible_texts(driver: webdriver.Remote) -> list[str]:
+    texts = visible_texts_raw(driver)
+    return unique_texts(texts)
+
+
+def merged_scene_texts(
+    driver: webdriver.Remote,
+    ocr_engine: Optional[RapidOCR],
+    prefer_ocr_for_popup: bool = False,
+) -> list[str]:
+    if prefer_ocr_for_popup:
+        texts = visible_texts_raw(driver)
+    else:
+        texts = visible_texts(driver)
+    if ocr_engine is None:
+        return texts
+    need_ocr = prefer_ocr_for_popup or not extract_countdown_seconds(texts) or parse_reference_value_yuan(texts) is None
+    if not need_ocr:
+        return texts
+    ocr_ts = ocr_texts(driver, ocr_engine)
+    if prefer_ocr_for_popup:
+        # Keep duplicates/order in popup mode for countdown token patterns like "00 00 后开奖".
+        return texts + ocr_ts
+    return unique_texts(texts + ocr_ts)
+
+
+def extract_countdown_seconds(texts: list[str]) -> list[int]:
+    values: list[int] = []
     mmss = re.compile(r"(?<!\d)(\d{1,2}):([0-5]\d)(?!\d)")
-    sec_only = re.compile(r"(?<!\d)(\d{1,3})\s*秒")
+    sec_only = re.compile(r"(?<!\d)(\d{1,3})\s*秒(?!\s*(?:后开奖|后开))")
     min_sec = re.compile(r"(?<!\d)(\d{1,2})\s*分(?:钟)?\s*(\d{1,2})\s*秒")
+    split_open_draw = re.compile(r"(?<!\d)(\d{1,2})\s*[\|\s]+\s*([0-5]?\d)\s*[\|\s]*(?:后开奖|后开)")
+    open_draw_mmss = re.compile(r"(?<!\d)(\d{1,2})\s*[:：]\s*([0-5]\d)\s*(?:后开奖|后开)")
+    open_draw_minsec = re.compile(r"(?<!\d)(\d{1,2})\s*分(?:钟)?\s*([0-5]?\d)\s*秒?\s*(?:后开奖|后开)")
+    open_draw_seconds = re.compile(r"(?<!分)(?<!\d)(\d{1,3})\s*秒\s*(?:后开奖|后开)")
     for t in texts:
         for m in mmss.finditer(t):
             sec = int(m.group(1)) * 60 + int(m.group(2))
-            if 0 <= sec <= 3600 and (best is None or sec < best):
-                best = sec
+            if 0 <= sec <= 3600:
+                values.append(sec)
         for m in min_sec.finditer(t):
             sec = int(m.group(1)) * 60 + int(m.group(2))
-            if 0 <= sec <= 3600 and (best is None or sec < best):
-                best = sec
+            if 0 <= sec <= 3600:
+                values.append(sec)
         for m in sec_only.finditer(t):
             sec = int(m.group(1))
-            if 0 <= sec <= 3600 and (best is None or sec < best):
-                best = sec
-    return best
+            if 0 <= sec <= 3600:
+                values.append(sec)
+    joined = " | ".join(texts)
+    for m in split_open_draw.finditer(joined):
+        sec = int(m.group(1)) * 60 + int(m.group(2))
+        if 0 <= sec <= 3600:
+            values.append(sec)
+    for m in open_draw_mmss.finditer(joined):
+        sec = int(m.group(1)) * 60 + int(m.group(2))
+        if 0 <= sec <= 3600:
+            values.append(sec)
+    for m in open_draw_minsec.finditer(joined):
+        sec = int(m.group(1)) * 60 + int(m.group(2))
+        if 0 <= sec <= 3600:
+            values.append(sec)
+    for m in open_draw_seconds.finditer(joined):
+        sec = int(m.group(1))
+        if 0 <= sec <= 3600:
+            values.append(sec)
+    return values
+
+
+def parse_countdown_seconds(texts: list[str]) -> Optional[int]:
+    values = extract_countdown_seconds(texts)
+    return min(values) if values else None
+
+
+def parse_popup_draw_countdown_seconds(texts: list[str]) -> Optional[int]:
+    candidates: list[int] = []
+    mmss_after_open = re.compile(r"(?<!\d)(\d{1,2})\s*[:：]\s*([0-5]\d)\s*(?:后开奖|后开)")
+    minsec_after_open = re.compile(r"(?<!\d)(\d{1,2})\s*分(?:钟)?\s*([0-5]?\d)\s*秒?\s*(?:后开奖|后开)")
+    sec_after_open = re.compile(r"(?<!分)(?<!\d)(\d{1,3})\s*秒\s*(?:后开奖|后开)")
+
+    for t in texts:
+        for m in mmss_after_open.finditer(t):
+            sec = int(m.group(1)) * 60 + int(m.group(2))
+            if 0 <= sec <= 3600:
+                candidates.append(sec)
+        for m in minsec_after_open.finditer(t):
+            sec = int(m.group(1)) * 60 + int(m.group(2))
+            if 0 <= sec <= 3600:
+                candidates.append(sec)
+        for m in sec_after_open.finditer(t):
+            sec = int(m.group(1))
+            if 0 <= sec <= 3600:
+                candidates.append(sec)
+
+    # Handle tokenized form around "后开奖", with possible unrelated tokens in between.
+    for i, token in enumerate(texts):
+        t = (token or "").strip()
+        if "后开奖" not in t and "后开" not in t:
+            continue
+        left = max(0, i - 6)
+        window = [((x or "").strip()) for x in texts[left : i + 1]]
+        # case: "... 10 57 后开奖"
+        nums = []
+        for w in window:
+            m = re.fullmatch(r"(\d{1,2})", w)
+            if m:
+                nums.append(int(m.group(1)))
+        if len(nums) >= 2:
+            mm, ss = nums[-2], nums[-1]
+            if 0 <= mm <= 59 and 0 <= ss <= 59:
+                candidates.append(mm * 60 + ss)
+        # case: "... 10:57 ... 后开奖" or "... 10分57秒 ... 后开奖"
+        for w in window:
+            m = re.search(r"(?<!\d)(\d{1,2})\s*[:：]\s*([0-5]\d)(?!\d)", w)
+            if m:
+                candidates.append(int(m.group(1)) * 60 + int(m.group(2)))
+            m = re.search(r"(?<!\d)(\d{1,2})\s*分(?:钟)?\s*([0-5]?\d)\s*秒?", w)
+            if m:
+                candidates.append(int(m.group(1)) * 60 + int(m.group(2)))
+            m = re.search(r"(?<!分)(?<!\d)(\d{1,3})\s*秒", w)
+            if m:
+                candidates.append(int(m.group(1)))
+
+    if candidates:
+        return min(candidates)
+    return None
 
 
 def detect_draw_result(texts: list[str]) -> Optional[str]:
@@ -391,6 +536,7 @@ def handle_post_join_draw_flow(
 ) -> bool:
     draw_result = wait_countdown_and_check_result(
         driver,
+        ocr_engine=ocr_engine,
         grace_seconds=draw_countdown_grace,
         poll_interval=draw_poll_interval,
         max_wait_seconds=draw_result_max_wait,
@@ -412,24 +558,60 @@ def is_diamond_luckybag_popup(texts: list[str]) -> bool:
 
 
 def is_popup_countdown_zero(texts: list[str]) -> bool:
-    left = parse_countdown_seconds(texts)
+    left = parse_popup_draw_countdown_seconds(texts)
     if left == 0:
+        return True
+    if left is not None and left <= 1 and has_popup_draw_anchor(texts):
+        # OCR/accessibility occasionally jitters 00:00 as 1s at the boundary.
         return True
     joined = " | ".join(texts)
     zero_patterns = [
         re.compile(r"00:00"),
         re.compile(r"0:00"),
+        re.compile(r"0{1,2}\s*[:：]\s*0{1,2}\s*(?:后开奖|后开)"),
+        re.compile(r"0{1,2}\s*[\|\s]+\s*0{1,2}\s*[\|\s]*(?:后开奖|后开)"),
         re.compile(r"00\s*分\s*00\s*秒"),
         re.compile(r"00\s*时\s*00\s*分\s*00\s*秒"),
     ]
-    return any(p.search(joined) for p in zero_patterns)
+    if any(p.search(joined) for p in zero_patterns):
+        return True
+
+    # Token-window fallback: around "后开奖", if countdown-like tokens are all zero, treat as invalid.
+    for i, token in enumerate(texts):
+        t = (token or "").strip()
+        if "后开奖" not in t and "后开" not in t:
+            continue
+        left_idx = max(0, i - 6)
+        window = [((x or "").strip()) for x in texts[left_idx : i + 1]]
+        zero_pairs = [w for w in window if re.fullmatch(r"0{1,2}", w)]
+        if len(zero_pairs) >= 2:
+            return True
+        for w in window:
+            if re.fullmatch(r"0{1,2}\s*[:：]\s*0{1,2}", w):
+                return True
+            if re.fullmatch(r"0{1,2}\s*分(?:钟)?\s*0{1,2}\s*秒?", w):
+                return True
+            if re.fullmatch(r"0{1,2}\s*秒", w):
+                return True
+    return False
+
+
+def has_popup_draw_anchor(texts: list[str]) -> bool:
+    for t in texts:
+        s = (t or "").strip()
+        if not s:
+            continue
+        if "后开奖" in s or "后开" in s:
+            return True
+    return False
 
 
 def parse_reference_value_yuan(texts: list[str]) -> Optional[float]:
     value_patterns = [
-        re.compile(r"参考价值[^0-9]{0,6}([0-9]+(?:\.[0-9]+)?)\s*元"),
-        re.compile(r"参考价值[^0-9]{0,6}¥\s*([0-9]+(?:\.[0-9]+)?)"),
-        re.compile(r"参考价值[^0-9]{0,6}([0-9]+(?:\.[0-9]+)?)"),
+        re.compile(r"(?:参考)?(?:价值|价)[^0-9¥￥]{0,12}[¥￥]?\s*([0-9][0-9,]*(?:\.[0-9]+)?)\s*(万)?\s*元?"),
+        re.compile(r"(?:参考)?(?:价值|价)[^0-9¥￥]{0,12}([0-9][0-9,]*(?:\.[0-9]+)?)\s*(万)"),
+        re.compile(r"(?:参考)?(?:价值|价)[^0-9¥￥]{0,12}[¥￥]\s*([0-9][0-9,]*(?:\.[0-9]+)?)"),
+        re.compile(r"[¥￥]\s*([0-9][0-9,]*(?:\.[0-9]+)?)"),
     ]
     for t in texts:
         for p in value_patterns:
@@ -437,24 +619,29 @@ def parse_reference_value_yuan(texts: list[str]) -> Optional[float]:
             if not m:
                 continue
             try:
-                return float(m.group(1))
+                raw_num = m.group(1).replace(",", "")
+                value = float(raw_num)
+                if len(m.groups()) >= 2 and m.group(2):
+                    value *= 10000.0
+                return value
             except Exception:
                 continue
     return None
 
 
 def is_low_value_long_countdown_popup(texts: list[str]) -> bool:
-    left = parse_countdown_seconds(texts)
+    left = parse_popup_draw_countdown_seconds(texts)
     if left is None or left <= 300:
         return False
     ref_value = parse_reference_value_yuan(texts)
     if ref_value is None:
         return False
-    return ref_value < 100.0
+    return ref_value < 500.0
 
 
 def wait_countdown_and_check_result(
     driver: webdriver.Remote,
+    ocr_engine: Optional[RapidOCR] = None,
     grace_seconds: float = 2.0,
     poll_interval: float = 1.0,
     max_wait_seconds: int = 240,
@@ -475,7 +662,7 @@ def wait_countdown_and_check_result(
     last_no_countdown_log_ts = 0.0
 
     while time.time() < dynamic_deadline:
-        texts = visible_texts(driver)
+        texts = merged_scene_texts(driver, ocr_engine)
         result = detect_draw_result(texts)
         if result is not None:
             log(f"Draw result detected: {result}")
@@ -765,18 +952,17 @@ def run_task_panel_actions(
             tapped_this_round += 1
             time.sleep(0.65)
 
-        if tapped_this_round == 0:
-            # Strict fallback for red CTA text buttons (e.g. "一键发表评论").
-            text_hits = pick_task_text_buttons(driver, ocr_engine)
-            for h in text_hits:
-                if any(abs(h.x - px) <= 12 and abs(h.y - py) <= 12 for px, py in clicked_points):
-                    continue
-                log(f"Tap TASK (text-fallback:{h.source}) -> '{h.text}' @ ({h.x},{h.y})")
-                tap(driver, h.x, h.y)
-                clicked_points.append((h.x, h.y))
-                taps += 1
-                tapped_this_round += 1
-                time.sleep(0.65)
+        # Text CTA fallback (e.g. "一键发表评论", "加入粉丝团").
+        text_hits = pick_task_text_buttons(driver, ocr_engine)
+        for h in text_hits:
+            if any(abs(h.x - px) <= 12 and abs(h.y - py) <= 12 for px, py in clicked_points):
+                continue
+            log(f"Tap TASK (text-fallback:{h.source}) -> '{h.text}' @ ({h.x},{h.y})")
+            tap(driver, h.x, h.y)
+            clicked_points.append((h.x, h.y))
+            taps += 1
+            tapped_this_round += 1
+            time.sleep(0.65)
 
         if tapped_this_round == 0:
             break
@@ -937,7 +1123,7 @@ def main() -> int:
                 open_retry_count += 1
                 time.sleep(1.0)
 
-                popup_texts = visible_texts(driver)
+                popup_texts = merged_scene_texts(driver, ocr_engine, prefer_ocr_for_popup=True)
                 if is_diamond_luckybag_popup(popup_texts):
                     log("Diamond lucky-bag popup detected, skip and switch to next room.")
                     switch_room_hard(driver, ocr_engine, post_wait=args.post_swipe_wait)
@@ -952,11 +1138,32 @@ def main() -> int:
                     open_retry_count = 0
                     no_open_rounds = 0
                     continue
+                popup_left = parse_popup_draw_countdown_seconds(popup_texts)
+                if popup_left is None and has_popup_draw_anchor(popup_texts):
+                    # Re-read once to avoid transient OCR/accessibility misses on countdown digits.
+                    time.sleep(0.45)
+                    popup_texts_retry = merged_scene_texts(driver, ocr_engine, prefer_ocr_for_popup=True)
+                    popup_left = parse_popup_draw_countdown_seconds(popup_texts_retry)
+                    popup_texts = popup_texts_retry
+                if popup_left is None and has_popup_draw_anchor(popup_texts):
+                    log("Lucky-bag popup has '后开奖' but countdown is unreadable, treat as invalid and switch.")
+                    switch_room_hard(driver, ocr_engine, post_wait=args.post_swipe_wait)
+                    last_swipe_ts = time.time()
+                    open_retry_count = 0
+                    no_open_rounds = 0
+                    continue
+                if popup_left is not None and popup_left > 300:
+                    ref_val_dbg = parse_reference_value_yuan(popup_texts)
+                    log(f"Long-countdown popup detected (countdown={popup_left}s, ref={ref_val_dbg}元).")
+                    if ref_val_dbg is None:
+                        ref_related = [t for t in popup_texts if any(k in t for k in ["价", "¥", "￥", "元", "参考"])]
+                        if ref_related:
+                            log(f"Price text candidates: {' | '.join(ref_related[:8])}")
                 if is_low_value_long_countdown_popup(popup_texts):
                     ref_val = parse_reference_value_yuan(popup_texts)
-                    left = parse_countdown_seconds(popup_texts)
+                    left = popup_left
                     log(
-                        f"Physical bag filtered (countdown={left}s, ref={ref_val}元 < 99), switch to next room."
+                        f"Physical bag filtered (countdown={left}s, ref={ref_val}元 < 500), switch to next room."
                     )
                     switch_room_hard(driver, ocr_engine, post_wait=args.post_swipe_wait)
                     last_swipe_ts = time.time()
