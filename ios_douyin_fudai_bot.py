@@ -1,15 +1,11 @@
 #!/usr/bin/env python3
 """
-iOS Douyin lucky-bag auto helper (Appium + OCR fallback).
+iOS Douyin lucky-bag bot (Appium + optional OCR).
 
-Usage example:
-  python3 scripts/ios_douyin_fudai_bot.py \
-    --udid <YOUR_UDID> \
-    --appium http://127.0.0.1:4723 \
-    --max-minutes 20
-
-Install deps:
-  pip install Appium-Python-Client pillow numpy rapidocr-onnxruntime
+Design goals:
+- Deterministic state flow (scan -> open -> task -> wait draw/result -> switch room)
+- Avoid false positives from hidden accessibility text
+- Keep running until confirmed win (or explicit red-packet exit signal)
 """
 
 from __future__ import annotations
@@ -17,6 +13,7 @@ from __future__ import annotations
 import argparse
 import random
 import re
+import subprocess
 import sys
 import time
 from collections import deque
@@ -35,6 +32,8 @@ except Exception:
     RapidOCR = None
 
 
+# ---- Text rules ----
+
 JOIN_KEYWORDS = [
     "去参与",
     "立即参与",
@@ -43,11 +42,9 @@ JOIN_KEYWORDS = [
     "立刻参与",
 ]
 
-OPEN_KEYWORDS = [
-    "福袋",
-]
+OPEN_KEYWORDS = ["福袋"]
 
-TASK_KEYWORDS = [
+TASK_ACTION_TEXT_KEYWORDS = [
     "一键发表评论",
     "一键参与",
     "去完成",
@@ -58,13 +55,37 @@ TASK_KEYWORDS = [
     "发表评论",
     "去抢",
     "去领取",
-    "参与任务",
 ]
 
-SUCCESS_KEYWORDS = [
-    "已参与",
-    "参与成功",
+STRICT_TASK_ACTION_TEXT_KEYWORDS = [
+    "一键发表评论",
+    "一键参与",
+    "去完成",
+    "去参与",
+    "立即参与",
 ]
+
+TASK_ACTION_BLOCKLIST = [
+    "参与条件",
+    "福袋规则",
+    "任务说明",
+    "参与任务",
+    "人气榜",
+    "榜单",
+    "热榜",
+]
+
+TASK_TEXT_BLOCKLIST = [
+    "人已参与",
+    "已参与人数",
+    "共",
+    "剩余",
+    "开奖",
+]
+
+TASK_UNFINISHED_KEYWORDS = ["未达成", "未完成"]
+
+SUCCESS_KEYWORDS = ["已参与", "参与成功"]
 
 RESULT_WIN_KEYWORDS = [
     "恭喜抽中",
@@ -76,6 +97,8 @@ RESULT_WIN_KEYWORDS = [
 
 RESULT_LOSE_KEYWORDS = [
     "未中奖",
+    "未中签",
+    "没有抽中福袋",
     "很遗憾",
     "下次再来",
     "擦肩而过",
@@ -90,56 +113,28 @@ RESULT_WIN_PATTERNS = [
 
 RESULT_LOSE_PATTERNS = [
     re.compile(r"未中奖"),
+    re.compile(r"未中签"),
+    re.compile(r"没有抽中福袋"),
     re.compile(r"很遗憾"),
     re.compile(r"下次再来"),
     re.compile(r"擦肩而过"),
 ]
 
-DIAMOND_BAG_KEYWORDS = [
-    "钻石",
+DIAMOND_BAG_KEYWORDS = ["钻石", "抖币", "音浪"]
+
+NON_PHYSICAL_BAG_KEYWORDS = [
+    "红包",
+    "金币",
+    "福气",
+    "福气值",
+    "任务红包",
+    "现金红包",
     "抖币",
     "音浪",
+    "钻石",
 ]
 
-PHYSICAL_BAG_HINT_KEYWORDS = [
-    "实物",
-    "商品",
-    "礼品",
-    "包邮",
-]
-
-TASK_UNFINISHED_KEYWORDS = [
-    "未达成",
-    "未完成",
-]
-
-TASK_ACTION_TEXT_KEYWORDS = [
-    "一键发表评论",
-    "加入粉丝团",
-    "去加入粉丝团",
-    "加入粉丝",
-    "去加入粉丝",
-    "一键参与",
-    "去完成",
-    "去参与",
-    "立即参与",
-    "去领取",
-    "去抢",
-]
-
-TASK_ACTION_BLOCKLIST = [
-    "参与条件",
-    "福袋规则",
-    "任务说明",
-]
-
-TASK_TEXT_BLOCKLIST = [
-    "人已参与",
-    "已参与人数",
-    "共",
-    "剩余",
-    "开奖",
-]
+PHYSICAL_BAG_HINT_KEYWORDS = ["实物", "商品", "礼品", "包邮"]
 
 BLOCKED_KEYWORDS = [
     "暂未开始",
@@ -153,29 +148,33 @@ BLOCKED_KEYWORDS = [
     "人数已满",
 ]
 
-CLOSE_KEYWORDS = [
-    "关闭",
-    "取消",
-    "我知道了",
-    "稍后再说",
-    "返回",
-]
+RED_PACKET_EXIT_KEYWORDS = ["的红包"]
+
+CLOSE_KEYWORDS = ["关闭", "取消", "我知道了", "稍后再说", "返回"]
 
 PANEL_HINT_KEYWORDS = [
     "福袋规则",
     "参与条件",
     "去发表评论",
+    "查看中奖观众",
+    "我知道了",
+    "没有抽中福袋",
     "倒计时",
     "参考价值",
+    "后开奖",
+    "参与任务",
 ]
 
-OPEN_TEXT_BLOCKLIST = [
-    "没有抽中",
-    "未抽中",
-    "抽中福袋",
-    "已开奖",
+LOSE_POPUP_HINT_KEYWORDS = [
+    "没有抽中福袋",
+    "未中签",
+    "我知道了",
+    "查看中奖观众",
     "开奖结果",
+    "已开奖",
 ]
+
+OPEN_TEXT_BLOCKLIST = ["没有抽中", "未抽中", "抽中福袋", "已开奖", "开奖结果"]
 
 ELEMENT_TYPES = (
     "XCUIElementTypeButton",
@@ -183,6 +182,16 @@ ELEMENT_TYPES = (
     "XCUIElementTypeOther",
 )
 
+OPEN_ENTRY_ELEMENT_TYPES = (
+    "XCUIElementTypeButton",
+    "XCUIElementTypeStaticText",
+)
+OPEN_ENTRY_REGION_X_MAX_RATIO = 0.52
+OPEN_ENTRY_REGION_Y_MAX_RATIO = 0.52
+POPUP_REGION_Y_MIN_RATIO = 0.50
+
+
+# ---- Models ----
 
 @dataclass
 class Hit:
@@ -192,8 +201,32 @@ class Hit:
     source: str
 
 
+# ---- Core helpers ----
+
 def log(msg: str) -> None:
     print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
+
+
+def auto_detect_udid() -> Optional[str]:
+    try:
+        out = subprocess.check_output(
+            ["xcrun", "xctrace", "list", "devices"],
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+    except Exception:
+        return None
+
+    udids: list[str] = []
+    p = re.compile(r"\(([0-9A-Fa-f-]{20,})\)\s*$")
+    for line in out.splitlines():
+        s = line.strip()
+        if not s or "Simulator" in s or "Mac" in s:
+            continue
+        m = p.search(s)
+        if m:
+            udids.append(m.group(1))
+    return udids[0] if udids else None
 
 
 def build_driver(
@@ -209,6 +242,10 @@ def build_driver(
     wda_launch_timeout_ms: int = 120000,
     wda_connection_timeout_ms: int = 120000,
     use_new_wda: bool = False,
+    wda_startup_retries: int = 2,
+    wda_startup_retry_interval_ms: int = 15000,
+    wait_for_idle_timeout: float = 0.0,
+    wait_for_quiescence: bool = False,
 ) -> webdriver.Remote:
     opts = XCUITestOptions()
     opts.platform_name = "iOS"
@@ -216,6 +253,7 @@ def build_driver(
     opts.udid = udid
     opts.bundle_id = bundle_id
     opts.set_capability("noReset", no_reset)
+
     if xcode_org_id:
         opts.set_capability("xcodeOrgId", xcode_org_id)
         opts.set_capability("xcodeSigningId", "Apple Development")
@@ -227,9 +265,15 @@ def build_driver(
         opts.set_capability("allowProvisioningUpdates", True)
     if allow_provisioning_device_registration:
         opts.set_capability("allowProvisioningDeviceRegistration", True)
+
     opts.set_capability("wdaLaunchTimeout", int(wda_launch_timeout_ms))
     opts.set_capability("wdaConnectionTimeout", int(wda_connection_timeout_ms))
     opts.set_capability("useNewWDA", bool(use_new_wda))
+    opts.set_capability("wdaStartupRetries", int(wda_startup_retries))
+    opts.set_capability("wdaStartupRetryInterval", int(wda_startup_retry_interval_ms))
+    opts.set_capability("waitForIdleTimeout", float(wait_for_idle_timeout))
+    opts.set_capability("waitForQuiescence", bool(wait_for_quiescence))
+
     return webdriver.Remote(appium_url, options=opts)
 
 
@@ -237,33 +281,40 @@ def tap(driver: webdriver.Remote, x: int, y: int) -> None:
     driver.execute_script("mobile: tap", {"x": int(x), "y": int(y)})
 
 
-def native_candidates(driver: webdriver.Remote, keywords: Iterable[str]) -> list[Hit]:
+def native_candidates(
+    driver: webdriver.Remote,
+    keywords: Iterable[str],
+    element_types: Iterable[str] = ELEMENT_TYPES,
+) -> list[Hit]:
     expr_kw = " OR ".join(
         [f"name CONTAINS '{k}' OR label CONTAINS '{k}' OR value CONTAINS '{k}'" for k in keywords]
     )
-    expr_type = " OR ".join([f"type == '{t}'" for t in ELEMENT_TYPES])
+    expr_type = " OR ".join([f"type == '{t}'" for t in element_types])
     predicate = f"({expr_type}) AND ({expr_kw})"
-    elements = driver.find_elements(AppiumBy.IOS_PREDICATE, predicate)
 
-    hits: list[Hit] = []
+    elements = driver.find_elements(AppiumBy.IOS_PREDICATE, predicate)
+    out: list[Hit] = []
     for el in elements:
         try:
+            visible_attr = str(el.get_attribute("visible") or "").strip().lower()
+            if visible_attr and visible_attr not in ("1", "true", "yes"):
+                continue
             rect = el.rect
-            x = int(rect["x"] + rect["width"] / 2)
-            y = int(rect["y"] + rect["height"] / 2)
-            text = (el.get_attribute("label") or el.get_attribute("name") or "").strip()
             if rect["width"] < 8 or rect["height"] < 8:
                 continue
-            hits.append(Hit(text=text, x=x, y=y, source="native"))
+            x = int(rect["x"] + rect["width"] / 2)
+            y = int(rect["y"] + rect["height"] / 2)
+            text = (el.get_attribute("name") or el.get_attribute("label") or "").strip()
+            out.append(Hit(text=text, x=x, y=y, source="native"))
         except Exception:
             continue
-    return hits
+    return out
 
 
 def pick_best_hit(hits: list[Hit], keyword_priority: list[str]) -> Optional[Hit]:
     if not hits:
         return None
-    best: Optional[Hit] = None
+    best = hits[0]
     best_rank = 10**9
     for h in hits:
         rank = 10**9
@@ -274,76 +325,90 @@ def pick_best_hit(hits: list[Hit], keyword_priority: list[str]) -> Optional[Hit]
         if rank < best_rank:
             best_rank = rank
             best = h
-    return best or hits[0]
+    return best
 
 
 def filter_short_hits(hits: list[Hit], max_len: int) -> list[Hit]:
     out: list[Hit] = []
     for h in hits:
         t = (h.text or "").strip()
-        if not t:
-            continue
-        if len(t) <= max_len:
+        if t and len(t) <= max_len:
             out.append(h)
     return out
 
 
-def screenshot_np_safe(driver: webdriver.Remote) -> np.ndarray:
-    png = driver.get_screenshot_as_png()
+def filter_hits_to_open_entry_region(driver: webdriver.Remote, hits: list[Hit]) -> list[Hit]:
+    size = driver.get_window_size()
+    x_max = int(size["width"] * OPEN_ENTRY_REGION_X_MAX_RATIO)
+    y_max = int(size["height"] * OPEN_ENTRY_REGION_Y_MAX_RATIO)
+    return [h for h in hits if 0 <= h.x <= x_max and 0 <= h.y <= y_max]
+
+
+def find_open_entry_hit(driver: webdriver.Remote, ocr_engine: Optional[RapidOCR]) -> Optional[Hit]:
+    native_hits = filter_short_hits(
+        native_candidates(driver, OPEN_KEYWORDS, element_types=OPEN_ENTRY_ELEMENT_TYPES),
+        max_len=8,
+    )
+    native_hits = [h for h in native_hits if _is_valid_open_text(h.text)]
+    native_hits = filter_hits_to_open_entry_region(driver, native_hits)
+    hit = pick_best_hit(native_hits, OPEN_KEYWORDS)
+    if hit is not None:
+        return hit
+
+    if ocr_engine is None:
+        return None
+
+    ocr_hits = filter_short_hits(ocr_candidates(driver, ocr_engine, OPEN_KEYWORDS), max_len=8)
+    ocr_hits = [h for h in ocr_hits if _is_valid_open_text(h.text)]
+    ocr_hits = filter_hits_to_open_entry_region(driver, ocr_hits)
+    return pick_best_hit(ocr_hits, OPEN_KEYWORDS)
+
+
+def screenshot_np(driver: webdriver.Remote) -> np.ndarray:
     from io import BytesIO
 
+    png = driver.get_screenshot_as_png()
     img = Image.open(BytesIO(png))
     return np.array(img.convert("RGB"))
 
 
 def ocr_candidates(driver: webdriver.Remote, ocr_engine: RapidOCR, keywords: Iterable[str]) -> list[Hit]:
-    image = screenshot_np_safe(driver)
-    result, _ = ocr_engine(image)
+    img = screenshot_np(driver)
+    result, _ = ocr_engine(img)
     if not result:
         return []
 
-    hits: list[Hit] = []
-    for item in result:
-        # item: [box, text, score]
-        box, text, score = item
-        try:
-            s = float(score)
-        except Exception:
-            s = 0.0
-        if not text or s < 0.45:
+    out: list[Hit] = []
+    for box, text, score in result:
+        s = float(score) if score is not None else 0.0
+        t = str(text).strip() if text is not None else ""
+        if not t or s < 0.45:
             continue
-        txt = str(text).strip()
-        if not any(k in txt for k in keywords):
+        if not any(k in t for k in keywords):
             continue
         xs = [int(p[0]) for p in box]
         ys = [int(p[1]) for p in box]
-        x = int(sum(xs) / len(xs))
-        y = int(sum(ys) / len(ys))
-        hits.append(Hit(text=txt, x=x, y=y, source="ocr"))
-    return hits
+        out.append(Hit(text=t, x=int(sum(xs)/len(xs)), y=int(sum(ys)/len(ys)), source="ocr"))
+    return out
 
 
 def ocr_texts(driver: webdriver.Remote, ocr_engine: RapidOCR, min_score: float = 0.45) -> list[str]:
-    image = screenshot_np_safe(driver)
-    result, _ = ocr_engine(image)
+    img = screenshot_np(driver)
+    result, _ = ocr_engine(img)
     if not result:
         return []
-    texts: list[str] = []
-    for item in result:
-        _, text, score = item
-        try:
-            s = float(score)
-        except Exception:
-            s = 0.0
+    out: list[str] = []
+    for _, text, score in result:
+        s = float(score) if score is not None else 0.0
         t = str(text).strip() if text is not None else ""
         if t and s >= min_score:
-            texts.append(t)
-    return texts
+            out.append(t)
+    return out
 
 
 def unique_texts(texts: list[str]) -> list[str]:
-    out: list[str] = []
     seen: set[str] = set()
+    out: list[str] = []
     for t in texts:
         s = (t or "").strip()
         if not s or s in seen:
@@ -353,63 +418,119 @@ def unique_texts(texts: list[str]) -> list[str]:
     return out
 
 
-def contains_success(driver: webdriver.Remote, ocr_engine: Optional[RapidOCR]) -> bool:
-    native = native_candidates(driver, SUCCESS_KEYWORDS)
-    native = [h for h in native if _is_valid_success_text(h.text)]
-    if native:
-        return True
-    if ocr_engine is None:
-        return False
-    ocr_hits = ocr_candidates(driver, ocr_engine, SUCCESS_KEYWORDS)
-    ocr_hits = [h for h in ocr_hits if _is_valid_success_text(h.text)]
-    return bool(ocr_hits)
+def visible_texts_raw(driver: webdriver.Remote, lower_half_only: bool = False) -> list[str]:
+    try:
+        elements = driver.find_elements(
+            AppiumBy.IOS_PREDICATE,
+            "type == 'XCUIElementTypeStaticText' OR type == 'XCUIElementTypeButton'",
+        )
+    except Exception:
+        return []
 
+    y_min = 0
+    if lower_half_only:
+        size = driver.get_window_size()
+        y_min = int(size["height"] * POPUP_REGION_Y_MIN_RATIO)
 
-def visible_texts_raw(driver: webdriver.Remote) -> list[str]:
-    texts: list[str] = []
-    elements = driver.find_elements(
-        AppiumBy.IOS_PREDICATE,
-        "type == 'XCUIElementTypeStaticText' OR type == 'XCUIElementTypeButton'",
-    )
+    out: list[str] = []
     for el in elements:
         try:
-            t = (
-                el.get_attribute("label")
-                or el.get_attribute("name")
-                or el.get_attribute("value")
-                or ""
-            ).strip()
+            visible_attr = str(el.get_attribute("visible") or "").strip().lower()
+            if visible_attr and visible_attr not in ("1", "true", "yes"):
+                continue
+            if lower_half_only:
+                rect = el.rect
+                if rect["width"] < 4 or rect["height"] < 4:
+                    continue
+                cy = int(rect["y"] + rect["height"] / 2)
+                if cy < y_min:
+                    continue
+            t = (el.get_attribute("name") or el.get_attribute("label") or el.get_attribute("value") or "").strip()
+            if t:
+                out.append(t)
         except Exception:
-            t = ""
-        if t:
-            texts.append(t)
-    return texts
+            continue
+    return out
 
 
 def visible_texts(driver: webdriver.Remote) -> list[str]:
-    texts = visible_texts_raw(driver)
-    return unique_texts(texts)
+    return unique_texts(visible_texts_raw(driver))
 
 
 def merged_scene_texts(
     driver: webdriver.Remote,
     ocr_engine: Optional[RapidOCR],
     prefer_ocr_for_popup: bool = False,
+    popup_lower_half: bool = False,
 ) -> list[str]:
     if prefer_ocr_for_popup:
-        texts = visible_texts_raw(driver)
+        texts = visible_texts_raw(driver, lower_half_only=popup_lower_half)
     else:
         texts = visible_texts(driver)
     if ocr_engine is None:
         return texts
-    need_ocr = prefer_ocr_for_popup or not extract_countdown_seconds(texts) or parse_reference_value_yuan(texts) is None
+    need_ocr = prefer_ocr_for_popup
+    if not need_ocr:
+        need_ocr = (parse_popup_draw_countdown_seconds(texts) is None) or (parse_reference_value_yuan(texts) is None)
     if not need_ocr:
         return texts
+
     ocr_ts = ocr_texts(driver, ocr_engine)
     if prefer_ocr_for_popup:
-        # Keep duplicates/order in popup mode for countdown token patterns like "00 00 后开奖".
         return texts + ocr_ts
     return unique_texts(texts + ocr_ts)
+
+
+# ---- Text parsing ----
+
+def _is_valid_success_text(text: str) -> bool:
+    t = (text or "").strip()
+    if not t:
+        return False
+    if "人已参与" in t:
+        return False
+    if "已参与" in t and len(t) > 8:
+        return False
+    return any(k in t for k in SUCCESS_KEYWORDS)
+
+
+def contains_success_in_texts(texts: list[str]) -> bool:
+    return any(_is_valid_success_text(t) for t in texts)
+
+
+def has_popup_draw_anchor(texts: list[str]) -> bool:
+    return any(("后开奖" in (t or "")) or ("后开" in (t or "")) for t in texts)
+
+
+def has_luckybag_context(texts: list[str]) -> bool:
+    joined = " | ".join(texts)
+    if has_popup_draw_anchor(texts):
+        return True
+    if any(k in joined for k in PANEL_HINT_KEYWORDS):
+        return True
+    if "福袋" in joined and any(k in joined for k in ("开奖", "参与任务", "参考价值", "未达成", "已达成")):
+        return True
+    return False
+
+
+def contains_success_with_context(driver: webdriver.Remote, ocr_engine: Optional[RapidOCR]) -> bool:
+    texts = merged_scene_texts(driver, ocr_engine, prefer_ocr_for_popup=True, popup_lower_half=True)
+    return contains_success_in_texts(texts) and has_luckybag_context(texts)
+
+
+def has_task_success_cta_text(texts: list[str]) -> bool:
+    joined = " | ".join(texts)
+    return ("参与成功" in joined) or ("等待开奖" in joined)
+
+
+def has_active_draw_countdown(driver: webdriver.Remote, ocr_engine: Optional[RapidOCR]) -> bool:
+    texts = merged_scene_texts(driver, ocr_engine, prefer_ocr_for_popup=True, popup_lower_half=True)
+    left = parse_popup_draw_countdown_seconds(texts)
+    if left is None:
+        left = parse_countdown_seconds(texts)
+    if left is None or left <= 0:
+        return False
+    return has_popup_draw_anchor(texts) or has_task_success_cta_text(texts)
 
 
 def extract_countdown_seconds(texts: list[str]) -> list[int]:
@@ -417,46 +538,50 @@ def extract_countdown_seconds(texts: list[str]) -> list[int]:
     mmss = re.compile(r"(?<!\d)(\d{1,2}):([0-5]\d)(?!\d)")
     sec_only = re.compile(r"(?<!\d)(\d{1,3})\s*秒(?!\s*(?:后开奖|后开))")
     min_sec = re.compile(r"(?<!\d)(\d{1,2})\s*分(?:钟)?\s*(\d{1,2})\s*秒")
-    split_open_draw = re.compile(r"(?<!\d)(\d{1,2})\s*[\|\s]+\s*([0-5]?\d)\s*[\|\s]*(?:后开奖|后开)")
-    open_draw_mmss = re.compile(r"(?<!\d)(\d{1,2})\s*[:：]\s*([0-5]\d)\s*(?:后开奖|后开)")
-    open_draw_minsec = re.compile(r"(?<!\d)(\d{1,2})\s*分(?:钟)?\s*([0-5]?\d)\s*秒?\s*(?:后开奖|后开)")
-    open_draw_seconds = re.compile(r"(?<!分)(?<!\d)(\d{1,3})\s*秒\s*(?:后开奖|后开)")
+
     for t in texts:
+        has_compound = False
         for m in mmss.finditer(t):
             sec = int(m.group(1)) * 60 + int(m.group(2))
             if 0 <= sec <= 3600:
                 values.append(sec)
+                has_compound = True
         for m in min_sec.finditer(t):
             sec = int(m.group(1)) * 60 + int(m.group(2))
             if 0 <= sec <= 3600:
                 values.append(sec)
-        for m in sec_only.finditer(t):
-            sec = int(m.group(1))
-            if 0 <= sec <= 3600:
-                values.append(sec)
+                has_compound = True
+        if not has_compound:
+            for m in sec_only.finditer(t):
+                sec = int(m.group(1))
+                if 0 <= sec <= 3600:
+                    values.append(sec)
+
     joined = " | ".join(texts)
-    for m in split_open_draw.finditer(joined):
+    p = re.compile(r"(?<!\d)(\d{1,2})\s*[:：]\s*([0-5]\d)\s*(?:后开奖|后开)")
+    for m in p.finditer(joined):
         sec = int(m.group(1)) * 60 + int(m.group(2))
         if 0 <= sec <= 3600:
             values.append(sec)
-    for m in open_draw_mmss.finditer(joined):
+
+    p2 = re.compile(r"(?<!\d)(\d{1,2})\s*分(?:钟)?\s*([0-5]?\d)\s*秒?\s*(?:后开奖|后开)")
+    for m in p2.finditer(joined):
         sec = int(m.group(1)) * 60 + int(m.group(2))
         if 0 <= sec <= 3600:
             values.append(sec)
-    for m in open_draw_minsec.finditer(joined):
-        sec = int(m.group(1)) * 60 + int(m.group(2))
-        if 0 <= sec <= 3600:
-            values.append(sec)
-    for m in open_draw_seconds.finditer(joined):
+
+    p3 = re.compile(r"(?<!分)(?<!\d)(\d{1,3})\s*秒\s*(?:后开奖|后开)")
+    for m in p3.finditer(joined):
         sec = int(m.group(1))
         if 0 <= sec <= 3600:
             values.append(sec)
+
     return values
 
 
 def parse_countdown_seconds(texts: list[str]) -> Optional[int]:
-    values = extract_countdown_seconds(texts)
-    return min(values) if values else None
+    vals = extract_countdown_seconds(texts)
+    return min(vals) if vals else None
 
 
 def parse_popup_draw_countdown_seconds(texts: list[str]) -> Optional[int]:
@@ -479,15 +604,12 @@ def parse_popup_draw_countdown_seconds(texts: list[str]) -> Optional[int]:
             if 0 <= sec <= 3600:
                 candidates.append(sec)
 
-    # Handle tokenized form around "后开奖", with possible unrelated tokens in between.
     for i, token in enumerate(texts):
         t = (token or "").strip()
         if "后开奖" not in t and "后开" not in t:
             continue
-        left = max(0, i - 6)
-        window = [((x or "").strip()) for x in texts[left : i + 1]]
-        # case: "... 10 57 后开奖"
-        nums = []
+        window = [((x or "").strip()) for x in texts[max(0, i - 6): i + 1]]
+        nums: list[int] = []
         for w in window:
             m = re.fullmatch(r"(\d{1,2})", w)
             if m:
@@ -496,28 +618,76 @@ def parse_popup_draw_countdown_seconds(texts: list[str]) -> Optional[int]:
             mm, ss = nums[-2], nums[-1]
             if 0 <= mm <= 59 and 0 <= ss <= 59:
                 candidates.append(mm * 60 + ss)
-        # case: "... 10:57 ... 后开奖" or "... 10分57秒 ... 后开奖"
-        for w in window:
-            m = re.search(r"(?<!\d)(\d{1,2})\s*[:：]\s*([0-5]\d)(?!\d)", w)
-            if m:
-                candidates.append(int(m.group(1)) * 60 + int(m.group(2)))
-            m = re.search(r"(?<!\d)(\d{1,2})\s*分(?:钟)?\s*([0-5]?\d)\s*秒?", w)
-            if m:
-                candidates.append(int(m.group(1)) * 60 + int(m.group(2)))
-            m = re.search(r"(?<!分)(?<!\d)(\d{1,3})\s*秒", w)
-            if m:
-                candidates.append(int(m.group(1)))
 
-    if candidates:
-        return min(candidates)
+    return min(candidates) if candidates else None
+
+
+def parse_open_entry_countdown_seconds(text: str) -> Optional[int]:
+    t = (text or "").strip()
+    if not t:
+        return None
+    m = re.search(r"(?<!\d)(\d{1,2})\s*[:：]\s*([0-5]\d)(?!\d)", t)
+    if m:
+        return int(m.group(1)) * 60 + int(m.group(2))
+    m = re.search(r"(?<!\d)(\d{1,2})\s*分(?:钟)?\s*([0-5]?\d)\s*秒", t)
+    if m:
+        return int(m.group(1)) * 60 + int(m.group(2))
+    m = re.search(r"(?<!\d)(\d{1,2})\s*分(?:钟)?(?!\s*\d)", t)
+    if m:
+        return int(m.group(1)) * 60
+    m = re.search(r"(?<!\d)(\d{1,3})\s*秒", t)
+    if m:
+        return int(m.group(1))
+    return None
+
+
+def is_popup_countdown_zero(texts: list[str]) -> bool:
+    left = parse_popup_draw_countdown_seconds(texts)
+    if left == 0:
+        return True
+    if left is not None and left <= 1 and has_popup_draw_anchor(texts):
+        return True
+
+    joined = " | ".join(texts)
+    patterns = [
+        re.compile(r"00:00"),
+        re.compile(r"0:00"),
+        re.compile(r"0{1,2}\s*[:：]\s*0{1,2}\s*(?:后开奖|后开)"),
+        re.compile(r"00\s*分\s*00\s*秒"),
+    ]
+    return any(p.search(joined) for p in patterns)
+
+
+def parse_reference_value_yuan(texts: list[str]) -> Optional[float]:
+    patterns = [
+        re.compile(r"(?:参考)?(?:价值|价)[^0-9¥￥]{0,12}[¥￥]?\s*([0-9][0-9,]*(?:\.[0-9]+)?)\s*(万)?\s*元?"),
+        re.compile(r"[¥￥]\s*([0-9][0-9,]*(?:\.[0-9]+)?)"),
+    ]
+    for t in texts:
+        for p in patterns:
+            m = p.search(t)
+            if not m:
+                continue
+            try:
+                v = float(m.group(1).replace(",", ""))
+                if len(m.groups()) >= 2 and m.group(2):
+                    v *= 10000.0
+                return v
+            except Exception:
+                continue
     return None
 
 
 def detect_draw_result(texts: list[str]) -> Optional[str]:
     joined = " | ".join(texts)
-    if any(k in joined for k in RESULT_LOSE_KEYWORDS):
+    left = parse_popup_draw_countdown_seconds(texts)
+    if left is None:
+        left = parse_countdown_seconds(texts)
+    # Guard: do not treat lose as final result while countdown is still running.
+    lose_allowed = (left is None) or (left <= 1)
+    if lose_allowed and any(k in joined for k in RESULT_LOSE_KEYWORDS):
         return "lose"
-    if any(p.search(joined) for p in RESULT_LOSE_PATTERNS):
+    if lose_allowed and any(p.search(joined) for p in RESULT_LOSE_PATTERNS):
         return "lose"
     if any(k in joined for k in RESULT_WIN_KEYWORDS):
         return "win"
@@ -526,292 +696,69 @@ def detect_draw_result(texts: list[str]) -> Optional[str]:
     return None
 
 
-def handle_post_join_draw_flow(
-    driver: webdriver.Remote,
-    ocr_engine: Optional[RapidOCR],
-    draw_countdown_grace: float,
-    draw_poll_interval: float,
-    draw_result_max_wait: int,
-    post_swipe_wait: float,
-) -> bool:
-    draw_result = wait_countdown_and_check_result(
-        driver,
-        ocr_engine=ocr_engine,
-        grace_seconds=draw_countdown_grace,
-        poll_interval=draw_poll_interval,
-        max_wait_seconds=draw_result_max_wait,
-    )
-    if draw_result == "win":
-        log("Winner detected in draw result popup. Finish task.")
-        return True
-
-    log("Draw result is not win. Close popup(s) and switch to next room.")
-    switch_room_hard(driver, ocr_engine, post_wait=post_swipe_wait)
-    return False
-
-
 def is_diamond_luckybag_popup(texts: list[str]) -> bool:
     joined = " | ".join(texts)
     has_diamond = any(k in joined for k in DIAMOND_BAG_KEYWORDS)
-    has_physical_hint = any(k in joined for k in PHYSICAL_BAG_HINT_KEYWORDS)
-    return has_diamond and not has_physical_hint
+    has_physical = any(k in joined for k in PHYSICAL_BAG_HINT_KEYWORDS)
+    return has_diamond and not has_physical
 
 
-def is_popup_countdown_zero(texts: list[str]) -> bool:
-    left = parse_popup_draw_countdown_seconds(texts)
-    if left == 0:
-        return True
-    if left is not None and left <= 1 and has_popup_draw_anchor(texts):
-        # OCR/accessibility occasionally jitters 00:00 as 1s at the boundary.
-        return True
+def is_non_physical_luckybag_popup(texts: list[str]) -> bool:
     joined = " | ".join(texts)
-    zero_patterns = [
-        re.compile(r"00:00"),
-        re.compile(r"0:00"),
-        re.compile(r"0{1,2}\s*[:：]\s*0{1,2}\s*(?:后开奖|后开)"),
-        re.compile(r"0{1,2}\s*[\|\s]+\s*0{1,2}\s*[\|\s]*(?:后开奖|后开)"),
-        re.compile(r"00\s*分\s*00\s*秒"),
-        re.compile(r"00\s*时\s*00\s*分\s*00\s*秒"),
-    ]
-    if any(p.search(joined) for p in zero_patterns):
-        return True
-
-    # Token-window fallback: around "后开奖", if countdown-like tokens are all zero, treat as invalid.
-    for i, token in enumerate(texts):
-        t = (token or "").strip()
-        if "后开奖" not in t and "后开" not in t:
-            continue
-        left_idx = max(0, i - 6)
-        window = [((x or "").strip()) for x in texts[left_idx : i + 1]]
-        zero_pairs = [w for w in window if re.fullmatch(r"0{1,2}", w)]
-        if len(zero_pairs) >= 2:
-            return True
-        for w in window:
-            if re.fullmatch(r"0{1,2}\s*[:：]\s*0{1,2}", w):
-                return True
-            if re.fullmatch(r"0{1,2}\s*分(?:钟)?\s*0{1,2}\s*秒?", w):
-                return True
-            if re.fullmatch(r"0{1,2}\s*秒", w):
-                return True
-    return False
-
-
-def has_popup_draw_anchor(texts: list[str]) -> bool:
-    for t in texts:
-        s = (t or "").strip()
-        if not s:
-            continue
-        if "后开奖" in s or "后开" in s:
-            return True
-    return False
-
-
-def parse_reference_value_yuan(texts: list[str]) -> Optional[float]:
-    value_patterns = [
-        re.compile(r"(?:参考)?(?:价值|价)[^0-9¥￥]{0,12}[¥￥]?\s*([0-9][0-9,]*(?:\.[0-9]+)?)\s*(万)?\s*元?"),
-        re.compile(r"(?:参考)?(?:价值|价)[^0-9¥￥]{0,12}([0-9][0-9,]*(?:\.[0-9]+)?)\s*(万)"),
-        re.compile(r"(?:参考)?(?:价值|价)[^0-9¥￥]{0,12}[¥￥]\s*([0-9][0-9,]*(?:\.[0-9]+)?)"),
-        re.compile(r"[¥￥]\s*([0-9][0-9,]*(?:\.[0-9]+)?)"),
-    ]
-    for t in texts:
-        for p in value_patterns:
-            m = p.search(t)
-            if not m:
-                continue
-            try:
-                raw_num = m.group(1).replace(",", "")
-                value = float(raw_num)
-                if len(m.groups()) >= 2 and m.group(2):
-                    value *= 10000.0
-                return value
-            except Exception:
-                continue
-    return None
+    has_non_physical = any(k in joined for k in NON_PHYSICAL_BAG_KEYWORDS)
+    has_physical = any(k in joined for k in PHYSICAL_BAG_HINT_KEYWORDS)
+    return has_non_physical and not has_physical
 
 
 def is_low_value_long_countdown_popup(texts: list[str]) -> bool:
     left = parse_popup_draw_countdown_seconds(texts)
+    if left is None:
+        left = parse_countdown_seconds(texts)
     if left is None or left <= 300:
         return False
-    ref_value = parse_reference_value_yuan(texts)
-    if ref_value is None:
+    val = parse_reference_value_yuan(texts)
+    if val is None:
         return False
-    return ref_value < 500.0
+    return val < 100.0
 
 
-def wait_countdown_and_check_result(
-    driver: webdriver.Remote,
-    ocr_engine: Optional[RapidOCR] = None,
-    grace_seconds: float = 2.0,
-    poll_interval: float = 1.0,
-    max_wait_seconds: int = 240,
-    timer_offset_seconds: float = 1.0,
-    result_probe_seconds: float = 8.0,
-    reopen_interval_seconds: float = 6.0,
-) -> str:
-    log("Join success, entering draw-result wait flow...")
-    log(
-        f"Draw wait config: max_wait={max_wait_seconds}s, timer_offset={timer_offset_seconds:.1f}s, probe={result_probe_seconds:.1f}s."
-    )
-    deadline = time.time() + max_wait_seconds
-    dynamic_deadline = deadline
-    countdown_found = False
-    last_reported_left: Optional[int] = None
-    countdown_target_ts: Optional[float] = None
-    last_reopen_ts = 0.0
-    last_no_countdown_log_ts = 0.0
-
-    while time.time() < dynamic_deadline:
-        texts = merged_scene_texts(driver, ocr_engine)
-        result = detect_draw_result(texts)
-        if result is not None:
-            log(f"Draw result detected: {result}")
-            return result
-
-        left = parse_countdown_seconds(texts)
-        if left is not None:
-            countdown_found = True
-            target = time.time() + left + timer_offset_seconds
-            if countdown_target_ts is None or target < countdown_target_ts:
-                countdown_target_ts = target
-            if countdown_target_ts < dynamic_deadline:
-                dynamic_deadline = countdown_target_ts
-            if last_reported_left is None or abs(left - last_reported_left) >= 3:
-                log(f"Countdown detected: {left}s, timer set to +{timer_offset_seconds:.1f}s.")
-                last_reported_left = left
-        else:
-            now = time.time()
-            if now - last_no_countdown_log_ts >= 8.0:
-                log("No countdown text detected in draw popup; trying to refresh popup state.")
-                last_no_countdown_log_ts = now
-            if now - last_reopen_ts >= reopen_interval_seconds:
-                open_hits = filter_short_hits(native_candidates(driver, OPEN_KEYWORDS), max_len=8)
-                open_hit = pick_best_hit(open_hits, OPEN_KEYWORDS)
-                if open_hit is not None:
-                    log(f"Re-open lucky-bag popup -> '{open_hit.text}' @ ({open_hit.x},{open_hit.y})")
-                    tap(driver, open_hit.x, open_hit.y)
-                    last_reopen_ts = now
-                    time.sleep(0.7)
-
-        if countdown_target_ts is not None and time.time() >= countdown_target_ts:
-            log("Countdown timer reached, probing draw result...")
-            probe_end = time.time() + max(2.0, result_probe_seconds + grace_seconds)
-            while time.time() < probe_end:
-                probe_texts = visible_texts(driver)
-                probe_result = detect_draw_result(probe_texts)
-                if probe_result is not None:
-                    log(f"Draw result detected after timer: {probe_result}")
-                    return probe_result
-                time.sleep(max(0.3, poll_interval))
-            log("Countdown timer reached but draw result text not found.")
-            return "unknown_after_countdown"
-
-        time.sleep(max(0.3, poll_interval))
-
-    texts = visible_texts(driver)
-    result = detect_draw_result(texts)
-    if result is not None:
-        log(f"Draw result detected at deadline: {result}")
-        return result
-    if countdown_found:
-        log("Countdown finished but draw result text not found.")
-        return "unknown_after_countdown"
-    log("No countdown found in wait window; draw result unknown.")
-    return "unknown_no_countdown"
-
-
-def _is_noise_task_text(text: str) -> bool:
-    t = (text or "").strip()
-    if not t:
+def is_luckybag_popup_visible(texts: list[str]) -> bool:
+    joined = " | ".join(texts)
+    if has_popup_draw_anchor(texts):
         return True
-    if any(k in t for k in TASK_TEXT_BLOCKLIST):
-        # allow explicit action text even if it contains "共"
-        if any(x in t for x in ("去参与", "立即参与", "一键", "去完成", "参与任务", "发表评论")):
-            return False
+    if any(k in joined for k in PANEL_HINT_KEYWORDS):
+        return True
+    if any(k in joined for k in TASK_UNFINISHED_KEYWORDS):
+        return True
+    if any(k in joined for k in TASK_ACTION_TEXT_KEYWORDS):
         return True
     return False
 
 
-def _is_valid_success_text(text: str) -> bool:
-    t = (text or "").strip()
-    if not t:
-        return False
-    if "人已参与" in t:
-        return False
-    if "已参与" in t and len(t) > 8:
-        return False
-    return any(k in t for k in SUCCESS_KEYWORDS)
-
-
-def find_red_button_centers(image: np.ndarray) -> list[tuple[int, int, int]]:
-    h, w, _ = image.shape
-    # Focus on lower half where task panel usually appears.
-    crop_top = int(h * 0.35)
-    roi = image[crop_top:, :, :]
-    # Downsample to reduce component search cost.
-    step = 3
-    small = roi[::step, ::step, :]
-    r = small[:, :, 0].astype(np.int16)
-    g = small[:, :, 1].astype(np.int16)
-    b = small[:, :, 2].astype(np.int16)
-    mask = (r > 180) & (g < 120) & (b < 120) & ((r - g) > 55) & ((r - b) > 55)
-    hh, ww = mask.shape
-    visited = np.zeros_like(mask, dtype=np.uint8)
-    centers: list[tuple[int, int, int]] = []
-    dirs = ((1, 0), (-1, 0), (0, 1), (0, -1))
-
-    for y in range(hh):
-        for x in range(ww):
-            if not mask[y, x] or visited[y, x]:
-                continue
-            q: deque[tuple[int, int]] = deque()
-            q.append((x, y))
-            visited[y, x] = 1
-            minx = maxx = x
-            miny = maxy = y
-            area = 0
-            while q:
-                cx, cy = q.popleft()
-                area += 1
-                if cx < minx:
-                    minx = cx
-                if cx > maxx:
-                    maxx = cx
-                if cy < miny:
-                    miny = cy
-                if cy > maxy:
-                    maxy = cy
-                for dx, dy in dirs:
-                    nx, ny = cx + dx, cy + dy
-                    if 0 <= nx < ww and 0 <= ny < hh and mask[ny, nx] and not visited[ny, nx]:
-                        visited[ny, nx] = 1
-                        q.append((nx, ny))
-
-            bw = maxx - minx + 1
-            bh = maxy - miny + 1
-            # Heuristic for red horizontal CTA buttons.
-            if area < 120 or bw < 24 or bh < 10:
-                continue
-            ratio = bw / max(1, bh)
-            if ratio < 1.4 or ratio > 10:
-                continue
-            cx = int(((minx + maxx) / 2) * step)
-            cy = int(((miny + maxy) / 2) * step + crop_top)
-            centers.append((cx, cy, area))
-
-    centers.sort(key=lambda t: t[2], reverse=True)
-    return centers[:6]
-
-
 def contains_blocked(driver: webdriver.Remote, ocr_engine: Optional[RapidOCR]) -> bool:
-    native = native_candidates(driver, BLOCKED_KEYWORDS)
-    if native:
+    hits = native_candidates(driver, BLOCKED_KEYWORDS)
+    if hits:
         return True
     if ocr_engine is None:
         return False
-    ocr_hits = ocr_candidates(driver, ocr_engine, BLOCKED_KEYWORDS)
-    return bool(ocr_hits)
+    return bool(ocr_candidates(driver, ocr_engine, BLOCKED_KEYWORDS))
 
+
+def contains_lose_popup(driver: webdriver.Remote, ocr_engine: Optional[RapidOCR]) -> bool:
+    texts = merged_scene_texts(driver, ocr_engine, prefer_ocr_for_popup=True, popup_lower_half=True)
+    if detect_draw_result(texts) == "lose":
+        return True
+    joined = " | ".join(texts)
+    return any(k in joined for k in LOSE_POPUP_HINT_KEYWORDS)
+
+
+def contains_red_packet_exit_signal(driver: webdriver.Remote, ocr_engine: Optional[RapidOCR]) -> bool:
+    texts = merged_scene_texts(driver, ocr_engine, prefer_ocr_for_popup=True, popup_lower_half=True)
+    joined = " | ".join(texts)
+    return any(k in joined for k in RED_PACKET_EXIT_KEYWORDS)
+
+
+# ---- UI actions ----
 
 def swipe_to_next_room(driver: webdriver.Remote, duration: float = 0.35) -> None:
     size = driver.get_window_size()
@@ -830,26 +777,7 @@ def swipe_to_next_room(driver: webdriver.Remote, duration: float = 0.35) -> None
     )
 
 
-def switch_room_hard(
-    driver: webdriver.Remote,
-    ocr_engine: Optional[RapidOCR],
-    post_wait: float,
-) -> None:
-    # Ensure focus is back to live canvas before swipe.
-    dismiss_overlays(driver, ocr_engine, rounds=4)
-    size = driver.get_window_size()
-    tap(driver, int(size["width"] * 0.5), int(size["height"] * 0.14))
-    time.sleep(0.25)
-    swipe_to_next_room(driver, duration=0.40)
-    time.sleep(0.35)
-    swipe_to_next_room(driver, duration=0.40)
-    wait_seconds = 3.0 + random.uniform(0.0, 2.0)
-    log(f"Post-swipe wait: {wait_seconds:.2f}s")
-    time.sleep(wait_seconds)
-
-
 def dismiss_overlays(driver: webdriver.Remote, ocr_engine: Optional[RapidOCR], rounds: int = 4) -> int:
-    """Try best-effort close for popups/panels before room switch."""
     closed = 0
     for _ in range(rounds):
         hits = filter_short_hits(native_candidates(driver, CLOSE_KEYWORDS), max_len=8)
@@ -860,56 +788,182 @@ def dismiss_overlays(driver: webdriver.Remote, ocr_engine: Optional[RapidOCR], r
             log(f"Dismiss overlay ({hit.source}) -> '{hit.text}' @ ({hit.x},{hit.y})")
             tap(driver, hit.x, hit.y)
             closed += 1
-            time.sleep(0.45)
+            time.sleep(0.25)
             continue
 
-        # If lucky-bag panel still visible but no explicit close button, tap blank area.
-        panel_hints = native_candidates(driver, PANEL_HINT_KEYWORDS)
-        if not panel_hints and ocr_engine is not None:
-            panel_hints = ocr_candidates(driver, ocr_engine, PANEL_HINT_KEYWORDS)
-        if panel_hints:
+        panel_hits = native_candidates(driver, PANEL_HINT_KEYWORDS)
+        if not panel_hits and ocr_engine is not None:
+            panel_hits = ocr_candidates(driver, ocr_engine, PANEL_HINT_KEYWORDS)
+        if panel_hits:
             size = driver.get_window_size()
             x = int(size["width"] * 0.5)
-            y = int(size["height"] * 0.14)
+            y = int(size["height"] * 0.38)
             log(f"Dismiss overlay (blank area) @ ({x},{y})")
             tap(driver, x, y)
             closed += 1
-            time.sleep(0.45)
+            time.sleep(0.25)
             continue
         break
     return closed
 
 
+def switch_room_hard(driver: webdriver.Remote, ocr_engine: Optional[RapidOCR], post_wait: float) -> None:
+    dismiss_overlays(driver, ocr_engine, rounds=4)
+    size = driver.get_window_size()
+    tap(driver, int(size["width"] * 0.5), int(size["height"] * 0.38))
+    time.sleep(0.15)
+    swipe_to_next_room(driver, duration=0.40)
+    time.sleep(0.20)
+    swipe_to_next_room(driver, duration=0.40)
+    wait_seconds = 3.0 + random.uniform(0.0, 2.0)
+    log(f"Post-swipe wait: {wait_seconds:.2f}s")
+    time.sleep(wait_seconds)
+
+
+def try_open_popup_recheck_before_switch(
+    driver: webdriver.Remote,
+    ocr_engine: Optional[RapidOCR],
+    reason: str,
+) -> bool:
+    log(f"Pre-switch recheck ({reason}): try opening lucky-bag popup once.")
+    open_hit = find_open_entry_hit(driver, ocr_engine)
+    if open_hit is None:
+        log("Pre-switch recheck: no lucky-bag entry found.")
+        return False
+
+    log(f"Pre-switch recheck tap OPEN ({open_hit.source}) -> '{open_hit.text}' @ ({open_hit.x},{open_hit.y})")
+    tap(driver, open_hit.x, open_hit.y)
+    time.sleep(0.55)
+
+    popup_texts = merged_scene_texts(driver, ocr_engine, prefer_ocr_for_popup=True, popup_lower_half=True)
+    if not is_luckybag_popup_visible(popup_texts):
+        log("Pre-switch recheck: popup not visible after open tap.")
+        return False
+
+    if is_diamond_luckybag_popup(popup_texts):
+        log("Pre-switch recheck: diamond popup detected, keep switch decision.")
+        return False
+    if is_non_physical_luckybag_popup(popup_texts):
+        log("Pre-switch recheck: non-physical popup detected, keep switch decision.")
+        return False
+    if is_popup_countdown_zero(popup_texts):
+        log("Pre-switch recheck: popup countdown is 0, keep switch decision.")
+        return False
+    if is_low_value_long_countdown_popup(popup_texts):
+        ref_val = parse_reference_value_yuan(popup_texts)
+        left = parse_popup_draw_countdown_seconds(popup_texts)
+        if left is None:
+            left = parse_countdown_seconds(popup_texts)
+        log(f"Pre-switch recheck: low-value long countdown popup (countdown={left}s, ref={ref_val}元), keep switch.")
+        return False
+
+    left = parse_popup_draw_countdown_seconds(popup_texts)
+    if left is None:
+        left = parse_countdown_seconds(popup_texts)
+    if left is not None:
+        log(f"Pre-switch recheck hit valid popup, keep current room (countdown={left}s).")
+    else:
+        log("Pre-switch recheck hit popup, keep current room and continue processing.")
+    return True
+
+
+# ---- Task actions ----
+
 def _dedup_hits(hits: list[Hit], dist: int = 18) -> list[Hit]:
     out: list[Hit] = []
     for h in hits:
-        ok = True
+        keep = True
         for x in out:
             if abs(h.x - x.x) <= dist and abs(h.y - x.y) <= dist and h.text == x.text:
-                ok = False
+                keep = False
                 break
-        if ok:
+        if keep:
             out.append(h)
     return out
 
 
 def has_unfinished_task_text(driver: webdriver.Remote, ocr_engine: Optional[RapidOCR]) -> bool:
-    native = native_candidates(driver, TASK_UNFINISHED_KEYWORDS)
-    if native:
+    if native_candidates(driver, TASK_UNFINISHED_KEYWORDS):
         return True
     if ocr_engine is None:
         return False
-    ocr_hits = ocr_candidates(driver, ocr_engine, TASK_UNFINISHED_KEYWORDS)
-    return bool(ocr_hits)
+    return bool(ocr_candidates(driver, ocr_engine, TASK_UNFINISHED_KEYWORDS))
 
 
-def pick_task_text_buttons(driver: webdriver.Remote, ocr_engine: Optional[RapidOCR]) -> list[Hit]:
+def find_red_button_centers(image: np.ndarray) -> list[tuple[int, int, int]]:
+    h, w, _ = image.shape
+    crop_top = int(h * 0.35)
+    roi = image[crop_top:, :, :]
+
+    step = 3
+    small = roi[::step, ::step, :]
+    r = small[:, :, 0].astype(np.int16)
+    g = small[:, :, 1].astype(np.int16)
+    b = small[:, :, 2].astype(np.int16)
+    mask = (r > 180) & (g < 120) & (b < 120) & ((r - g) > 55) & ((r - b) > 55)
+
+    hh, ww = mask.shape
+    visited = np.zeros_like(mask, dtype=np.uint8)
+    out: list[tuple[int, int, int]] = []
+    dirs = ((1, 0), (-1, 0), (0, 1), (0, -1))
+
+    for y in range(hh):
+        for x in range(ww):
+            if not mask[y, x] or visited[y, x]:
+                continue
+            q: deque[tuple[int, int]] = deque([(x, y)])
+            visited[y, x] = 1
+            minx = maxx = x
+            miny = maxy = y
+            area = 0
+
+            while q:
+                cx, cy = q.popleft()
+                area += 1
+                minx = min(minx, cx)
+                maxx = max(maxx, cx)
+                miny = min(miny, cy)
+                maxy = max(maxy, cy)
+                for dx, dy in dirs:
+                    nx, ny = cx + dx, cy + dy
+                    if 0 <= nx < ww and 0 <= ny < hh and mask[ny, nx] and not visited[ny, nx]:
+                        visited[ny, nx] = 1
+                        q.append((nx, ny))
+
+            bw = maxx - minx + 1
+            bh = maxy - miny + 1
+            if area < 120 or bw < 24 or bh < 10:
+                continue
+            ratio = bw / max(1, bh)
+            if ratio < 1.4 or ratio > 10:
+                continue
+            cx = int(((minx + maxx) / 2) * step)
+            cy = int(((miny + maxy) / 2) * step + crop_top)
+            out.append((cx, cy, area))
+
+    x_min = int(w * 0.12)
+    x_max = int(w * 0.88)
+    y_min = int(h * 0.55)
+    y_max = int(h * 0.95)
+    out = [c for c in out if x_min <= c[0] <= x_max and y_min <= c[1] <= y_max]
+    out.sort(key=lambda t: t[2], reverse=True)
+    return out[:6]
+
+
+def pick_task_text_buttons(
+    driver: webdriver.Remote,
+    ocr_engine: Optional[RapidOCR],
+    strict_only: bool = False,
+) -> list[Hit]:
     size = driver.get_window_size()
-    min_y = int(size["height"] * 0.42)
+    min_y = int(size["height"] * 0.55)
     max_y = int(size["height"] * 0.96)
-    hits = native_candidates(driver, TASK_ACTION_TEXT_KEYWORDS)
+    keys = STRICT_TASK_ACTION_TEXT_KEYWORDS if strict_only else TASK_ACTION_TEXT_KEYWORDS
+
+    hits = native_candidates(driver, keys)
     if not hits and ocr_engine is not None:
-        hits = ocr_candidates(driver, ocr_engine, TASK_ACTION_TEXT_KEYWORDS)
+        hits = ocr_candidates(driver, ocr_engine, keys)
+
     out: list[Hit] = []
     for h in hits:
         t = (h.text or "").strip()
@@ -917,9 +971,11 @@ def pick_task_text_buttons(driver: webdriver.Remote, ocr_engine: Optional[RapidO
             continue
         if any(k in t for k in TASK_ACTION_BLOCKLIST):
             continue
-        if not any(k in t for k in TASK_ACTION_TEXT_KEYWORDS):
+        if not any(k in t for k in keys):
             continue
         if h.y < min_y or h.y > max_y:
+            continue
+        if any(k in t for k in TASK_TEXT_BLOCKLIST):
             continue
         out.append(h)
     return _dedup_hits(out, dist=14)
@@ -934,27 +990,31 @@ def run_task_panel_actions(
     clicked_points: list[tuple[int, int]] = []
     still_unfinished = has_unfinished_task_text(driver, ocr_engine)
 
+    panel_texts = merged_scene_texts(driver, ocr_engine, prefer_ocr_for_popup=True, popup_lower_half=True)
+    panel_confirmed = any(k in " | ".join(panel_texts) for k in PANEL_HINT_KEYWORDS)
+    strict_text_only_mode = not panel_confirmed
+    if strict_text_only_mode:
+        log("Lucky-bag panel hints not found; fallback to strict text-task taps only.")
+
     for round_idx in range(rounds):
         if not still_unfinished and round_idx > 0:
             break
 
-        # Only click red CTA buttons in lucky-bag popup to avoid invalid text taps.
-        img = screenshot_np_safe(driver)
-        reds = find_red_button_centers(img)
         tapped_this_round = 0
-        for rx, ry, _ in reds:
-            if any(abs(rx - px) <= 15 and abs(ry - py) <= 15 for px, py in clicked_points):
-                continue
-            log(f"Tap TASK (red-shape) @ ({rx},{ry})")
-            tap(driver, rx, ry)
-            clicked_points.append((rx, ry))
-            taps += 1
-            tapped_this_round += 1
-            time.sleep(0.65)
 
-        # Text CTA fallback (e.g. "一键发表评论", "加入粉丝团").
-        text_hits = pick_task_text_buttons(driver, ocr_engine)
-        for h in text_hits:
+        if not strict_text_only_mode:
+            img = screenshot_np(driver)
+            for rx, ry, _ in find_red_button_centers(img):
+                if any(abs(rx - px) <= 15 and abs(ry - py) <= 15 for px, py in clicked_points):
+                    continue
+                log(f"Tap TASK (red-shape) @ ({rx},{ry})")
+                tap(driver, rx, ry)
+                clicked_points.append((rx, ry))
+                taps += 1
+                tapped_this_round += 1
+                time.sleep(0.35)
+
+        for h in pick_task_text_buttons(driver, ocr_engine, strict_only=strict_text_only_mode):
             if any(abs(h.x - px) <= 12 and abs(h.y - py) <= 12 for px, py in clicked_points):
                 continue
             log(f"Tap TASK (text-fallback:{h.source}) -> '{h.text}' @ ({h.x},{h.y})")
@@ -962,19 +1022,160 @@ def run_task_panel_actions(
             clicked_points.append((h.x, h.y))
             taps += 1
             tapped_this_round += 1
-            time.sleep(0.65)
+            time.sleep(0.35)
 
         if tapped_this_round == 0:
             break
 
-        time.sleep(0.7)
+        time.sleep(0.35)
         still_unfinished = has_unfinished_task_text(driver, ocr_engine)
         if still_unfinished:
-            log("Task status still contains '未达成', continue tapping red buttons...")
+            log("Task status still contains '未达成', continue tapping...")
 
     still_unfinished = has_unfinished_task_text(driver, ocr_engine)
     return taps, still_unfinished
 
+
+# ---- Draw wait ----
+
+def wait_countdown_and_check_result(
+    driver: webdriver.Remote,
+    ocr_engine: Optional[RapidOCR],
+    grace_seconds: float,
+    poll_interval: float,
+    sample_interval: float,
+    max_wait_seconds: int,
+    timer_offset_seconds: float = 1.0,
+    result_probe_seconds: float = 8.0,
+    reopen_interval_seconds: float = 6.0,
+    max_no_bag_reopen_rounds: int = 3,
+) -> str:
+    log("Join success, entering draw-result wait flow...")
+    log(
+        f"Draw wait config: max_wait={max_wait_seconds}s, timer_offset={timer_offset_seconds:.1f}s, probe={result_probe_seconds:.1f}s."
+    )
+
+    deadline = time.time() + max_wait_seconds
+    dynamic_deadline = deadline
+    countdown_found = False
+    countdown_target_ts: Optional[float] = None
+    last_reported_left: Optional[int] = None
+
+    last_reopen_ts = 0.0
+    last_no_countdown_log_ts = 0.0
+    no_bag_reopen_rounds = 0
+
+    sample_step = max(0.5, float(sample_interval))
+    next_sample_ts = time.time()
+
+    while time.time() < dynamic_deadline:
+        now = time.time()
+        if now < next_sample_ts:
+            time.sleep(min(0.2, next_sample_ts - now))
+            continue
+        next_sample_ts = now + sample_step
+
+        texts = merged_scene_texts(driver, ocr_engine, prefer_ocr_for_popup=True, popup_lower_half=True)
+        result = detect_draw_result(texts)
+        if result is not None:
+            log(f"Draw result detected: {result}")
+            return result
+
+        left = parse_popup_draw_countdown_seconds(texts)
+        if left is None:
+            left = parse_countdown_seconds(texts)
+        if left is not None:
+            countdown_found = True
+            target = time.time() + left + timer_offset_seconds
+            if countdown_target_ts is None or target > countdown_target_ts:
+                countdown_target_ts = target
+            # Once countdown is known, extend wait window to at least countdown target.
+            if countdown_target_ts > dynamic_deadline:
+                dynamic_deadline = countdown_target_ts
+            if last_reported_left is None or abs(left - last_reported_left) >= 3:
+                log(f"Countdown detected: {left}s, timer set to +{timer_offset_seconds:.1f}s.")
+                last_reported_left = left
+        else:
+            if now - last_no_countdown_log_ts >= 8.0:
+                log("No countdown text detected in draw popup; trying to refresh popup state.")
+                last_no_countdown_log_ts = now
+
+            if now - last_reopen_ts >= reopen_interval_seconds:
+                open_hit = find_open_entry_hit(driver, ocr_engine)
+                if open_hit is not None:
+                    log(f"Re-open lucky-bag popup -> '{open_hit.text}' @ ({open_hit.x},{open_hit.y})")
+                    tap(driver, open_hit.x, open_hit.y)
+                    no_bag_reopen_rounds = 0
+                    time.sleep(0.7)
+                else:
+                    no_bag_reopen_rounds += 1
+                    log(
+                        f"No lucky-bag entry while waiting for draw result ({no_bag_reopen_rounds}/{max_no_bag_reopen_rounds})."
+                    )
+                    if no_bag_reopen_rounds >= max_no_bag_reopen_rounds:
+                        log("Draw popup appears stale/no-bag; keep waiting for countdown/result.")
+                last_reopen_ts = now
+
+        if countdown_target_ts is not None and time.time() >= countdown_target_ts:
+            log("Countdown timer reached, probing draw result...")
+            probe_end = time.time() + max(2.0, result_probe_seconds + grace_seconds)
+            while time.time() < probe_end:
+                probe_now = time.time()
+                if probe_now < next_sample_ts:
+                    time.sleep(min(0.2, next_sample_ts - probe_now))
+                    continue
+                next_sample_ts = probe_now + sample_step
+
+                probe_texts = visible_texts_raw(driver, lower_half_only=True)
+                probe_result = detect_draw_result(probe_texts)
+                if probe_result is not None:
+                    log(f"Draw result detected after timer: {probe_result}")
+                    return probe_result
+                time.sleep(max(0.3, poll_interval))
+            log("Countdown timer reached but draw result text not found.")
+            return "unknown_after_countdown"
+
+    texts = visible_texts_raw(driver, lower_half_only=True)
+    result = detect_draw_result(texts)
+    if result is not None:
+        log(f"Draw result detected at deadline: {result}")
+        return result
+    if countdown_found:
+        log("Countdown finished but draw result text not found.")
+        return "unknown_after_countdown"
+    log("No countdown found in wait window; draw result unknown.")
+    return "unknown_no_countdown"
+
+
+def handle_post_join_draw_flow(
+    driver: webdriver.Remote,
+    ocr_engine: Optional[RapidOCR],
+    draw_countdown_grace: float,
+    draw_poll_interval: float,
+    draw_sample_interval: float,
+    draw_result_max_wait: int,
+    post_swipe_wait: float,
+) -> str:
+    result = wait_countdown_and_check_result(
+        driver,
+        ocr_engine=ocr_engine,
+        grace_seconds=draw_countdown_grace,
+        poll_interval=draw_poll_interval,
+        sample_interval=draw_sample_interval,
+        max_wait_seconds=draw_result_max_wait,
+    )
+    if result == "win":
+        log("Winner detected in draw result popup. Finish task.")
+        return "win"
+    if result == "lose":
+        log("Draw result is lose. Close popup(s) and switch to next room.")
+        switch_room_hard(driver, ocr_engine, post_wait=post_swipe_wait)
+        return "lose"
+    log("Draw result unknown. Stay in current room and keep monitoring.")
+    return "unknown"
+
+
+# ---- Main loop ----
 
 def _is_valid_open_text(text: str) -> bool:
     t = (text or "").strip()
@@ -988,233 +1189,499 @@ def _is_valid_open_text(text: str) -> bool:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--appium", default="http://127.0.0.1:4723")
-    parser.add_argument("--udid", required=True)
+    parser.add_argument("--udid", default="auto")
     parser.add_argument("--bundle-id", default="com.ss.iphone.ugc.Aweme")
     parser.add_argument("--max-minutes", type=int, default=0)
     parser.add_argument("--no-reset", action="store_true", default=True)
     parser.add_argument("--interval-min", type=float, default=0.7)
     parser.add_argument("--interval-max", type=float, default=1.2)
+
     parser.add_argument("--xcode-org-id", default=None)
     parser.add_argument("--updated-wda-bundle-id", default=None)
     parser.add_argument("--show-xcode-log", action="store_true")
     parser.add_argument("--allow-provisioning-updates", action="store_true")
     parser.add_argument("--allow-provisioning-device-registration", action="store_true")
+
     parser.add_argument("--blocked-swipe-cooldown", type=float, default=4.0)
     parser.add_argument("--open-retry-before-swipe", type=int, default=5)
     parser.add_argument("--post-swipe-wait", type=float, default=3.0)
+
     parser.add_argument("--draw-countdown-grace", type=float, default=2.0)
     parser.add_argument("--draw-poll-interval", type=float, default=1.0)
+    parser.add_argument("--draw-sample-interval", type=float, default=2.0)
     parser.add_argument("--draw-result-max-wait", type=int, default=240)
+
+    parser.add_argument("--room-stall-seconds", type=float, default=45.0)
+    parser.add_argument("--max-collapse-reopen-rounds", type=int, default=2)
+    parser.add_argument("--max-unfinished-rounds", type=int, default=2)
+
     parser.add_argument("--wda-launch-timeout-ms", type=int, default=120000)
     parser.add_argument("--wda-connection-timeout-ms", type=int, default=120000)
     parser.add_argument("--use-new-wda", action="store_true")
+    parser.add_argument("--wda-startup-retries", type=int, default=2)
+    parser.add_argument("--wda-startup-retry-interval-ms", type=int, default=15000)
+    parser.add_argument("--wait-for-idle-timeout", type=float, default=0.0)
+    parser.add_argument("--wait-for-quiescence", action="store_true", default=False)
+
     args = parser.parse_args()
+
+    if args.udid == "auto":
+        detected = auto_detect_udid()
+        if not detected:
+            raise RuntimeError("Cannot auto-detect iOS real-device UDID. Pass --udid explicitly.")
+        args.udid = detected
+        log(f"Auto-detected UDID: {args.udid}")
 
     ocr_engine = RapidOCR() if RapidOCR is not None else None
     if ocr_engine is None:
         log("OCR engine unavailable, running native-only.")
 
     log("Connecting to Appium...")
-    driver = build_driver(
-        args.appium,
-        args.udid,
-        args.bundle_id,
-        args.no_reset,
-        xcode_org_id=args.xcode_org_id,
-        updated_wda_bundle_id=args.updated_wda_bundle_id,
-        show_xcode_log=args.show_xcode_log,
-        allow_provisioning_updates=args.allow_provisioning_updates,
-        allow_provisioning_device_registration=args.allow_provisioning_device_registration,
-        wda_launch_timeout_ms=args.wda_launch_timeout_ms,
-        wda_connection_timeout_ms=args.wda_connection_timeout_ms,
-        use_new_wda=args.use_new_wda,
-    )
-    end_at: Optional[float]
-    if args.max_minutes > 0:
-        end_at = time.time() + args.max_minutes * 60
+    driver: Optional[webdriver.Remote] = None
+    try:
+        driver = build_driver(
+            args.appium,
+            args.udid,
+            args.bundle_id,
+            args.no_reset,
+            xcode_org_id=args.xcode_org_id,
+            updated_wda_bundle_id=args.updated_wda_bundle_id,
+            show_xcode_log=args.show_xcode_log,
+            allow_provisioning_updates=args.allow_provisioning_updates,
+            allow_provisioning_device_registration=args.allow_provisioning_device_registration,
+            wda_launch_timeout_ms=args.wda_launch_timeout_ms,
+            wda_connection_timeout_ms=args.wda_connection_timeout_ms,
+            use_new_wda=args.use_new_wda,
+            wda_startup_retries=args.wda_startup_retries,
+            wda_startup_retry_interval_ms=args.wda_startup_retry_interval_ms,
+            wait_for_idle_timeout=args.wait_for_idle_timeout,
+            wait_for_quiescence=args.wait_for_quiescence,
+        )
+    except Exception as e:
+        msg = str(e)
+        should_retry = ("WebDriverAgent" in msg) or ("xcodebuild failed with code 70" in msg)
+        if not should_retry:
+            raise
+        log("WDA bootstrap failed, retrying session with useNewWDA=true ...")
+        time.sleep(2.0)
+        driver = build_driver(
+            args.appium,
+            args.udid,
+            args.bundle_id,
+            args.no_reset,
+            xcode_org_id=args.xcode_org_id,
+            updated_wda_bundle_id=args.updated_wda_bundle_id,
+            show_xcode_log=True,
+            allow_provisioning_updates=args.allow_provisioning_updates,
+            allow_provisioning_device_registration=args.allow_provisioning_device_registration,
+            wda_launch_timeout_ms=max(args.wda_launch_timeout_ms, 180000),
+            wda_connection_timeout_ms=max(args.wda_connection_timeout_ms, 180000),
+            use_new_wda=True,
+            wda_startup_retries=max(3, args.wda_startup_retries),
+            wda_startup_retry_interval_ms=max(20000, args.wda_startup_retry_interval_ms),
+            wait_for_idle_timeout=args.wait_for_idle_timeout,
+            wait_for_quiescence=args.wait_for_quiescence,
+        )
+
+    end_at = (time.time() + args.max_minutes * 60) if args.max_minutes > 0 else None
+    if end_at is not None:
         log(f"Run with max-minutes={args.max_minutes}, but process exits only on confirmed win.")
     else:
-        end_at = None
         log("Run without max time limit; process exits only on confirmed win.")
-    last_click_key = None
+
+    last_click_key: Optional[str] = None
     last_click_ts = 0.0
     last_swipe_ts = 0.0
+
     open_retry_count = 0
     no_open_rounds = 0
+    collapse_reopen_rounds = 0
+    unfinished_same_popup_rounds = 0
+
+    room_enter_ts = time.time()
+    last_progress_ts = time.time()
 
     try:
         log("Started. Please manually stay in target live room.")
         while True:
             if end_at is not None and time.time() >= end_at:
-                # Keep running: user requires exit only when draw result is confirmed win.
                 end_at = None
                 log("Max-minutes reached; continue running until confirmed win.")
 
+            # Red-packet interruption: close overlays and exit immediately.
+            if contains_red_packet_exit_signal(driver, ocr_engine):
+                log("Detected red-packet signal ('的红包'), dismiss overlays and exit.")
+                dismiss_overlays(driver, ocr_engine, rounds=6)
+                size = driver.get_window_size()
+                tap(driver, int(size["width"] * 0.5), int(size["height"] * 0.38))
+                time.sleep(0.2)
+                return 0
+
+            # Highest priority: joined success with lucky-bag context -> wait draw result.
+            if contains_success_with_context(driver, ocr_engine):
+                log("Detected success text in loop, entering draw-result wait flow.")
+                draw_outcome = handle_post_join_draw_flow(
+                    driver,
+                    ocr_engine,
+                    draw_countdown_grace=args.draw_countdown_grace,
+                    draw_poll_interval=args.draw_poll_interval,
+                    draw_sample_interval=args.draw_sample_interval,
+                    draw_result_max_wait=args.draw_result_max_wait,
+                    post_swipe_wait=args.post_swipe_wait,
+                )
+                if draw_outcome == "win":
+                    return 0
+                if draw_outcome == "lose":
+                    last_swipe_ts = time.time()
+                    open_retry_count = 0
+                    no_open_rounds = 0
+                    collapse_reopen_rounds = 0
+                    unfinished_same_popup_rounds = 0
+                    room_enter_ts = time.time()
+                last_progress_ts = time.time()
+                continue
+
             if contains_blocked(driver, ocr_engine):
                 if time.time() - last_swipe_ts >= args.blocked_swipe_cooldown:
+                    if has_active_draw_countdown(driver, ocr_engine):
+                        log("Blocked text seen but active draw countdown is running; stay in current room.")
+                        last_progress_ts = time.time()
+                        time.sleep(random.uniform(args.interval_min, args.interval_max))
+                        continue
                     log("Detected blocked text, swiping to next live room...")
                     switch_room_hard(driver, ocr_engine, post_wait=args.post_swipe_wait)
                     last_swipe_ts = time.time()
                     open_retry_count = 0
                     no_open_rounds = 0
+                    collapse_reopen_rounds = 0
+                    unfinished_same_popup_rounds = 0
+                    room_enter_ts = time.time()
+                    last_progress_ts = time.time()
                     continue
 
-            # A) Strictly try join button first.
-            n_join = filter_short_hits(native_candidates(driver, JOIN_KEYWORDS), max_len=10)
-            join_hit = pick_best_hit(n_join, JOIN_KEYWORDS)
+            if contains_lose_popup(driver, ocr_engine):
+                log("Detected lose-result popup, close and switch to next room.")
+                switch_room_hard(driver, ocr_engine, post_wait=args.post_swipe_wait)
+                last_swipe_ts = time.time()
+                open_retry_count = 0
+                no_open_rounds = 0
+                collapse_reopen_rounds = 0
+                unfinished_same_popup_rounds = 0
+                room_enter_ts = time.time()
+                last_progress_ts = time.time()
+                continue
+
+            if (
+                time.time() - room_enter_ts >= args.room_stall_seconds
+                and time.time() - last_progress_ts >= args.room_stall_seconds
+                and time.time() - last_swipe_ts >= args.blocked_swipe_cooldown
+            ):
+                if has_active_draw_countdown(driver, ocr_engine):
+                    log("Room stall check skipped: active draw countdown detected.")
+                    last_progress_ts = time.time()
+                    time.sleep(random.uniform(args.interval_min, args.interval_max))
+                    continue
+                if try_open_popup_recheck_before_switch(driver, ocr_engine, reason="room-stall"):
+                    open_retry_count = 0
+                    no_open_rounds = 0
+                    collapse_reopen_rounds = 0
+                    unfinished_same_popup_rounds = 0
+                    last_progress_ts = time.time()
+                    time.sleep(random.uniform(args.interval_min, args.interval_max))
+                    continue
+                log(f"Room stall timeout ({args.room_stall_seconds:.0f}s without progress), switch to next room.")
+                switch_room_hard(driver, ocr_engine, post_wait=args.post_swipe_wait)
+                last_swipe_ts = time.time()
+                open_retry_count = 0
+                no_open_rounds = 0
+                collapse_reopen_rounds = 0
+                unfinished_same_popup_rounds = 0
+                room_enter_ts = time.time()
+                last_progress_ts = time.time()
+                continue
+
+            # A) Direct join button first.
+            join_hit = pick_best_hit(filter_short_hits(native_candidates(driver, JOIN_KEYWORDS), 10), JOIN_KEYWORDS)
             if join_hit is None and ocr_engine is not None:
-                o_join = filter_short_hits(ocr_candidates(driver, ocr_engine, JOIN_KEYWORDS), max_len=10)
-                join_hit = pick_best_hit(o_join, JOIN_KEYWORDS)
+                join_hit = pick_best_hit(filter_short_hits(ocr_candidates(driver, ocr_engine, JOIN_KEYWORDS), 10), JOIN_KEYWORDS)
 
             if join_hit is not None:
                 click_key = join_hit.text
                 if click_key == last_click_key and time.time() - last_click_ts < 5:
                     time.sleep(0.4)
                     continue
+
                 log(f"Tap JOIN ({join_hit.source}) -> '{join_hit.text}' @ ({join_hit.x},{join_hit.y})")
                 tap(driver, join_hit.x, join_hit.y)
                 last_click_key = click_key
                 last_click_ts = time.time()
+                last_progress_ts = time.time()
+
                 open_retry_count = 0
                 no_open_rounds = 0
-                time.sleep(1.5)
-                if contains_success(driver, ocr_engine):
-                    log("Detected success text: joined lucky draw.")
-                    if handle_post_join_draw_flow(
-                        driver,
-                        ocr_engine,
-                        draw_countdown_grace=args.draw_countdown_grace,
-                        draw_poll_interval=args.draw_poll_interval,
-                        draw_result_max_wait=args.draw_result_max_wait,
-                        post_swipe_wait=args.post_swipe_wait,
-                    ):
-                        return 0
-                    last_swipe_ts = time.time()
-                    open_retry_count = 0
-                    no_open_rounds = 0
-                    continue
-                # join click happened but no success, continue scanning
+                collapse_reopen_rounds = 0
+                unfinished_same_popup_rounds = 0
+
+                time.sleep(0.9)
                 continue
 
-            # B) If no join button, try opening lucky-bag panel.
-            n_open = [
-                h
-                for h in filter_short_hits(native_candidates(driver, OPEN_KEYWORDS), max_len=8)
-                if _is_valid_open_text(h.text)
-            ]
-            open_hit = pick_best_hit(n_open, OPEN_KEYWORDS)
-            if open_hit is None and ocr_engine is not None:
-                o_open = [
-                    h
-                    for h in filter_short_hits(ocr_candidates(driver, ocr_engine, OPEN_KEYWORDS), max_len=8)
-                    if _is_valid_open_text(h.text)
-                ]
-                open_hit = pick_best_hit(o_open, OPEN_KEYWORDS)
-            if open_hit is not None:
-                no_open_rounds = 0
-                click_key = f"open:{open_hit.text}"
-                if click_key == last_click_key and time.time() - last_click_ts < 3:
-                    time.sleep(0.3)
-                    continue
-                log(f"Tap OPEN ({open_hit.source}) -> '{open_hit.text}' @ ({open_hit.x},{open_hit.y})")
-                tap(driver, open_hit.x, open_hit.y)
-                last_click_key = click_key
-                last_click_ts = time.time()
-                open_retry_count += 1
-                time.sleep(1.0)
+            # B) Open lucky-bag panel.
+            open_hit = find_open_entry_hit(driver, ocr_engine)
 
-                popup_texts = merged_scene_texts(driver, ocr_engine, prefer_ocr_for_popup=True)
-                if is_diamond_luckybag_popup(popup_texts):
-                    log("Diamond lucky-bag popup detected, skip and switch to next room.")
-                    switch_room_hard(driver, ocr_engine, post_wait=args.post_swipe_wait)
-                    last_swipe_ts = time.time()
-                    open_retry_count = 0
-                    no_open_rounds = 0
-                    continue
-                if is_popup_countdown_zero(popup_texts):
-                    log("Lucky-bag popup countdown is 0, skip and switch to next room.")
-                    switch_room_hard(driver, ocr_engine, post_wait=args.post_swipe_wait)
-                    last_swipe_ts = time.time()
-                    open_retry_count = 0
-                    no_open_rounds = 0
-                    continue
-                popup_left = parse_popup_draw_countdown_seconds(popup_texts)
-                if popup_left is None and has_popup_draw_anchor(popup_texts):
-                    # Re-read once to avoid transient OCR/accessibility misses on countdown digits.
-                    time.sleep(0.45)
-                    popup_texts_retry = merged_scene_texts(driver, ocr_engine, prefer_ocr_for_popup=True)
-                    popup_left = parse_popup_draw_countdown_seconds(popup_texts_retry)
-                    popup_texts = popup_texts_retry
-                if popup_left is None and has_popup_draw_anchor(popup_texts):
-                    log("Lucky-bag popup has '后开奖' but countdown is unreadable, treat as invalid and switch.")
-                    switch_room_hard(driver, ocr_engine, post_wait=args.post_swipe_wait)
-                    last_swipe_ts = time.time()
-                    open_retry_count = 0
-                    no_open_rounds = 0
-                    continue
-                if popup_left is not None and popup_left > 300:
-                    ref_val_dbg = parse_reference_value_yuan(popup_texts)
-                    log(f"Long-countdown popup detected (countdown={popup_left}s, ref={ref_val_dbg}元).")
-                    if ref_val_dbg is None:
-                        ref_related = [t for t in popup_texts if any(k in t for k in ["价", "¥", "￥", "元", "参考"])]
-                        if ref_related:
-                            log(f"Price text candidates: {' | '.join(ref_related[:8])}")
-                if is_low_value_long_countdown_popup(popup_texts):
-                    ref_val = parse_reference_value_yuan(popup_texts)
-                    left = popup_left
-                    log(
-                        f"Physical bag filtered (countdown={left}s, ref={ref_val}元 < 500), switch to next room."
-                    )
-                    switch_room_hard(driver, ocr_engine, post_wait=args.post_swipe_wait)
-                    last_swipe_ts = time.time()
-                    open_retry_count = 0
-                    no_open_rounds = 0
-                    continue
-
-                task_taps, still_unfinished = run_task_panel_actions(
-                    driver,
-                    ocr_engine,
-                    rounds=6,
-                )
-                if task_taps > 0:
-                    log(f"Task panel taps: {task_taps}")
-                    open_retry_count = 0
-                if still_unfinished:
-                    log("Task still unfinished in popup, will keep trying in current room.")
-                if contains_success(driver, ocr_engine):
-                    log("Detected success text: joined lucky draw.")
-                    if handle_post_join_draw_flow(
-                        driver,
-                        ocr_engine,
-                        draw_countdown_grace=args.draw_countdown_grace,
-                        draw_poll_interval=args.draw_poll_interval,
-                        draw_result_max_wait=args.draw_result_max_wait,
-                        post_swipe_wait=args.post_swipe_wait,
-                    ):
-                        return 0
-                    last_swipe_ts = time.time()
-                    open_retry_count = 0
-                    no_open_rounds = 0
-                    continue
-                if open_retry_count >= args.open_retry_before_swipe and time.time() - last_swipe_ts >= args.blocked_swipe_cooldown:
-                    log("OPEN retries exceeded without JOIN, swiping to next live room...")
-                    switch_room_hard(driver, ocr_engine, post_wait=args.post_swipe_wait)
-                    last_swipe_ts = time.time()
-                    open_retry_count = 0
-            else:
+            if open_hit is None:
                 no_open_rounds += 1
                 if no_open_rounds >= 1 and time.time() - last_swipe_ts >= args.blocked_swipe_cooldown:
+                    if has_active_draw_countdown(driver, ocr_engine):
+                        log("No-open switch skipped: active draw countdown detected.")
+                        last_progress_ts = time.time()
+                        time.sleep(random.uniform(args.interval_min, args.interval_max))
+                        continue
+                    if try_open_popup_recheck_before_switch(driver, ocr_engine, reason="no-open"):
+                        open_retry_count = 0
+                        no_open_rounds = 0
+                        collapse_reopen_rounds = 0
+                        unfinished_same_popup_rounds = 0
+                        last_progress_ts = time.time()
+                        time.sleep(random.uniform(args.interval_min, args.interval_max))
+                        continue
                     log("No lucky-bag button in current room, swiping to next live room...")
                     switch_room_hard(driver, ocr_engine, post_wait=args.post_swipe_wait)
                     last_swipe_ts = time.time()
                     open_retry_count = 0
                     no_open_rounds = 0
+                    collapse_reopen_rounds = 0
+                    unfinished_same_popup_rounds = 0
+                    room_enter_ts = time.time()
+                    last_progress_ts = time.time()
+                time.sleep(random.uniform(args.interval_min, args.interval_max))
+                continue
+
+            no_open_rounds = 0
+            click_key = f"open:{open_hit.text}"
+            if click_key == last_click_key and time.time() - last_click_ts < 3:
+                time.sleep(0.2)
+                continue
+
+            log(f"Tap OPEN ({open_hit.source}) -> '{open_hit.text}' @ ({open_hit.x},{open_hit.y})")
+            tap(driver, open_hit.x, open_hit.y)
+            last_click_key = click_key
+            last_click_ts = time.time()
+            last_progress_ts = time.time()
+            open_retry_count += 1
+            time.sleep(0.55)
+
+            open_entry_left = parse_open_entry_countdown_seconds(open_hit.text)
+            if open_entry_left is not None:
+                log(f"Open-entry countdown parsed: {open_entry_left}s")
+
+            popup_texts = merged_scene_texts(driver, ocr_engine, prefer_ocr_for_popup=True, popup_lower_half=True)
+
+            if is_diamond_luckybag_popup(popup_texts):
+                log("Diamond lucky-bag popup detected, skip and switch to next room.")
+                switch_room_hard(driver, ocr_engine, post_wait=args.post_swipe_wait)
+                last_swipe_ts = time.time()
+                open_retry_count = 0
+                no_open_rounds = 0
+                collapse_reopen_rounds = 0
+                unfinished_same_popup_rounds = 0
+                room_enter_ts = time.time()
+                last_progress_ts = time.time()
+                continue
+
+            if is_non_physical_luckybag_popup(popup_texts):
+                log("Non-physical lucky-bag popup detected, skip and switch to next room.")
+                switch_room_hard(driver, ocr_engine, post_wait=args.post_swipe_wait)
+                last_swipe_ts = time.time()
+                open_retry_count = 0
+                no_open_rounds = 0
+                collapse_reopen_rounds = 0
+                unfinished_same_popup_rounds = 0
+                room_enter_ts = time.time()
+                last_progress_ts = time.time()
+                continue
+
+            if is_popup_countdown_zero(popup_texts):
+                log("Lucky-bag popup countdown is 0, skip and switch to next room.")
+                switch_room_hard(driver, ocr_engine, post_wait=args.post_swipe_wait)
+                last_swipe_ts = time.time()
+                open_retry_count = 0
+                no_open_rounds = 0
+                collapse_reopen_rounds = 0
+                unfinished_same_popup_rounds = 0
+                room_enter_ts = time.time()
+                last_progress_ts = time.time()
+                continue
+
+            popup_left = parse_popup_draw_countdown_seconds(popup_texts)
+            if popup_left is None and has_popup_draw_anchor(popup_texts):
+                time.sleep(0.25)
+                popup_texts = merged_scene_texts(driver, ocr_engine, prefer_ocr_for_popup=True, popup_lower_half=True)
+                popup_left = parse_popup_draw_countdown_seconds(popup_texts)
+            if popup_left is None and open_entry_left is not None:
+                popup_left = open_entry_left
+                log(f"Fallback to open-entry countdown: {popup_left}s")
+
+            popup_countdown_unreadable = popup_left is None and has_popup_draw_anchor(popup_texts)
+            if popup_countdown_unreadable:
+                log("Lucky-bag popup countdown unreadable, try task actions first.")
+
+            if popup_left is not None and popup_left > 300:
+                ref_dbg = parse_reference_value_yuan(popup_texts)
+                log(f"Long-countdown popup detected (countdown={popup_left}s, ref={ref_dbg}元).")
+
+            if is_low_value_long_countdown_popup(popup_texts):
+                ref_val = parse_reference_value_yuan(popup_texts)
+                log(f"Physical bag filtered (countdown={popup_left}s, ref={ref_val}元 < 100), switch to next room.")
+                switch_room_hard(driver, ocr_engine, post_wait=args.post_swipe_wait)
+                last_swipe_ts = time.time()
+                open_retry_count = 0
+                no_open_rounds = 0
+                collapse_reopen_rounds = 0
+                unfinished_same_popup_rounds = 0
+                room_enter_ts = time.time()
+                last_progress_ts = time.time()
+                continue
+
+            task_taps, still_unfinished = run_task_panel_actions(driver, ocr_engine, rounds=6)
+            if task_taps > 0:
+                log(f"Task panel taps: {task_taps}")
+                last_progress_ts = time.time()
+
+            if still_unfinished:
+                unfinished_same_popup_rounds += 1
+                log(f"Task still unfinished in popup ({unfinished_same_popup_rounds}/{args.max_unfinished_rounds}), continue trying.")
+                collapse_reopen_rounds = 0
+                if unfinished_same_popup_rounds >= args.max_unfinished_rounds:
+                    log("Unfinished task persists, switch to next room.")
+                    switch_room_hard(driver, ocr_engine, post_wait=args.post_swipe_wait)
+                    last_swipe_ts = time.time()
+                    open_retry_count = 0
+                    no_open_rounds = 0
+                    collapse_reopen_rounds = 0
+                    unfinished_same_popup_rounds = 0
+                    room_enter_ts = time.time()
+                    last_progress_ts = time.time()
+                    continue
+            else:
+                unfinished_same_popup_rounds = 0
+
+            post_popup_texts = merged_scene_texts(driver, ocr_engine, prefer_ocr_for_popup=True, popup_lower_half=True)
+            popup_visible_after = is_luckybag_popup_visible(post_popup_texts)
+            success_after = contains_success_in_texts(post_popup_texts) and has_luckybag_context(post_popup_texts)
+
+            post_left = parse_popup_draw_countdown_seconds(post_popup_texts)
+            if post_left is None:
+                post_left = parse_countdown_seconds(post_popup_texts)
+
+            if post_left and post_left > 0 and has_task_success_cta_text(post_popup_texts):
+                log(f"Detected task-success CTA with countdown={post_left}s, entering draw-result wait flow.")
+                draw_outcome = handle_post_join_draw_flow(
+                    driver,
+                    ocr_engine,
+                    draw_countdown_grace=args.draw_countdown_grace,
+                    draw_poll_interval=args.draw_poll_interval,
+                    draw_sample_interval=args.draw_sample_interval,
+                    draw_result_max_wait=args.draw_result_max_wait,
+                    post_swipe_wait=args.post_swipe_wait,
+                )
+                if draw_outcome == "win":
+                    return 0
+                if draw_outcome == "lose":
+                    last_swipe_ts = time.time()
+                    open_retry_count = 0
+                    no_open_rounds = 0
+                    collapse_reopen_rounds = 0
+                    unfinished_same_popup_rounds = 0
+                    room_enter_ts = time.time()
+                last_progress_ts = time.time()
+                continue
+
+            if success_after:
+                log("Detected success text after task actions, entering draw-result wait flow.")
+                draw_outcome = handle_post_join_draw_flow(
+                    driver,
+                    ocr_engine,
+                    draw_countdown_grace=args.draw_countdown_grace,
+                    draw_poll_interval=args.draw_poll_interval,
+                    draw_sample_interval=args.draw_sample_interval,
+                    draw_result_max_wait=args.draw_result_max_wait,
+                    post_swipe_wait=args.post_swipe_wait,
+                )
+                if draw_outcome == "win":
+                    return 0
+                if draw_outcome == "lose":
+                    last_swipe_ts = time.time()
+                    open_retry_count = 0
+                    no_open_rounds = 0
+                    collapse_reopen_rounds = 0
+                    unfinished_same_popup_rounds = 0
+                    room_enter_ts = time.time()
+                last_progress_ts = time.time()
+                continue
+
+            popup_countdown_unreadable = (post_left is None) and has_popup_draw_anchor(post_popup_texts)
+
+            if task_taps > 0 and (not still_unfinished) and (not success_after) and (not popup_visible_after):
+                collapse_reopen_rounds += 1
+                log(
+                    f"Popup collapsed after task tap but no success ({collapse_reopen_rounds}/{args.max_collapse_reopen_rounds})."
+                )
+                if collapse_reopen_rounds >= args.max_collapse_reopen_rounds:
+                    log("No progress after repeated collapsed-task flow, switch to next room.")
+                    switch_room_hard(driver, ocr_engine, post_wait=args.post_swipe_wait)
+                    last_swipe_ts = time.time()
+                    open_retry_count = 0
+                    no_open_rounds = 0
+                    collapse_reopen_rounds = 0
+                    unfinished_same_popup_rounds = 0
+                    room_enter_ts = time.time()
+                    last_progress_ts = time.time()
+                continue
+
+            if popup_visible_after or success_after:
+                collapse_reopen_rounds = 0
+
+            if popup_countdown_unreadable and (not success_after):
+                log("Lucky-bag popup has '后开奖' but countdown remains unreadable after task actions, switch.")
+                switch_room_hard(driver, ocr_engine, post_wait=args.post_swipe_wait)
+                last_swipe_ts = time.time()
+                open_retry_count = 0
+                no_open_rounds = 0
+                collapse_reopen_rounds = 0
+                unfinished_same_popup_rounds = 0
+                room_enter_ts = time.time()
+                last_progress_ts = time.time()
+                continue
+
+            if open_retry_count >= args.open_retry_before_swipe and time.time() - last_swipe_ts >= args.blocked_swipe_cooldown:
+                if has_active_draw_countdown(driver, ocr_engine):
+                    log("OPEN-retry switch skipped: active draw countdown detected.")
+                    last_progress_ts = time.time()
+                    time.sleep(random.uniform(args.interval_min, args.interval_max))
+                    continue
+                if try_open_popup_recheck_before_switch(driver, ocr_engine, reason="open-retry"):
+                    open_retry_count = 0
+                    no_open_rounds = 0
+                    collapse_reopen_rounds = 0
+                    unfinished_same_popup_rounds = 0
+                    last_progress_ts = time.time()
+                    time.sleep(random.uniform(args.interval_min, args.interval_max))
+                    continue
+                log("OPEN retries exceeded without JOIN, swiping to next live room...")
+                switch_room_hard(driver, ocr_engine, post_wait=args.post_swipe_wait)
+                last_swipe_ts = time.time()
+                open_retry_count = 0
+                no_open_rounds = 0
+                collapse_reopen_rounds = 0
+                unfinished_same_popup_rounds = 0
+                room_enter_ts = time.time()
+                last_progress_ts = time.time()
 
             time.sleep(random.uniform(args.interval_min, args.interval_max))
 
-        return 2
     finally:
-        driver.quit()
+        if driver is not None:
+            driver.quit()
 
 
 if __name__ == "__main__":

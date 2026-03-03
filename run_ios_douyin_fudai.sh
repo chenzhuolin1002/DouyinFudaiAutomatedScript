@@ -5,7 +5,7 @@ ROOT="$(cd "$(dirname "$0")" && pwd)"
 PY_SCRIPT="$ROOT/ios_douyin_fudai_bot.py"
 
 # Defaults (can be overridden via environment variables)
-UDID="${UDID:-00008030-00166DC93E50802E}"
+UDID="${UDID:-auto}"
 APPIUM_URL="${APPIUM_URL:-http://127.0.0.1:4723}"
 MAX_MINUTES="${MAX_MINUTES:-0}"
 XCODE_ORG_ID="${XCODE_ORG_ID:-997XR67PRS}"
