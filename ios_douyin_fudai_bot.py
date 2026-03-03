@@ -16,6 +16,7 @@ import re
 import subprocess
 import sys
 import time
+import xml.etree.ElementTree as ET
 from collections import deque
 from dataclasses import dataclass
 from typing import Iterable, Optional
@@ -46,6 +47,8 @@ OPEN_KEYWORDS = ["福袋"]
 
 TASK_ACTION_TEXT_KEYWORDS = [
     "一键发表评论",
+    "加入粉丝团",
+    "加入粉丝",
     "一键参与",
     "去完成",
     "去参与",
@@ -59,6 +62,8 @@ TASK_ACTION_TEXT_KEYWORDS = [
 
 STRICT_TASK_ACTION_TEXT_KEYWORDS = [
     "一键发表评论",
+    "加入粉丝团",
+    "加入粉丝",
     "一键参与",
     "去完成",
     "去参与",
@@ -91,7 +96,6 @@ RESULT_WIN_KEYWORDS = [
     "恭喜抽中",
     "恭喜你抽中",
     "恭喜你中奖了",
-    "已中奖",
     "抽中福袋",
 ]
 
@@ -107,7 +111,6 @@ RESULT_LOSE_KEYWORDS = [
 RESULT_WIN_PATTERNS = [
     re.compile(r"恭喜.*抽中"),
     re.compile(r"恭喜.*中奖"),
-    re.compile(r"已中奖"),
     re.compile(r"抽中.*福袋"),
 ]
 
@@ -189,6 +192,8 @@ OPEN_ENTRY_ELEMENT_TYPES = (
 OPEN_ENTRY_REGION_X_MAX_RATIO = 0.52
 OPEN_ENTRY_REGION_Y_MAX_RATIO = 0.52
 POPUP_REGION_Y_MIN_RATIO = 0.50
+OPEN_ENTRY_CACHE_TTL_SECONDS = 20.0
+OPEN_ENTRY_OCR_COOLDOWN_SECONDS = 2.5
 
 
 # ---- Models ----
@@ -202,6 +207,12 @@ class Hit:
 
 
 # ---- Core helpers ----
+
+_open_entry_cache_hit: Optional[Hit] = None
+_open_entry_cache_ts: float = 0.0
+_open_entry_next_ocr_ts: float = 0.0
+_open_entry_cache_ttl_seconds: float = OPEN_ENTRY_CACHE_TTL_SECONDS
+_open_entry_ocr_cooldown_seconds: float = OPEN_ENTRY_OCR_COOLDOWN_SECONDS
 
 def log(msg: str) -> None:
     print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
@@ -311,6 +322,79 @@ def native_candidates(
     return out
 
 
+def _to_int(v: object, default: int = 0) -> int:
+    try:
+        return int(float(str(v)))
+    except Exception:
+        return default
+
+
+def source_hits(
+    driver: webdriver.Remote,
+    element_types: Iterable[str],
+    keywords: Optional[Iterable[str]] = None,
+    upper_left_only: bool = False,
+    lower_half_only: bool = False,
+) -> list[Hit]:
+    try:
+        source = driver.page_source
+        root = ET.fromstring(source)
+    except Exception:
+        return []
+
+    screen_w = 0
+    screen_h = 0
+    for el in root.iter():
+        w = _to_int(el.attrib.get("width"), 0)
+        h = _to_int(el.attrib.get("height"), 0)
+        if w > 0 and h > 0:
+            screen_w = w
+            screen_h = h
+            break
+    if screen_w <= 0:
+        screen_w = 414
+    if screen_h <= 0:
+        screen_h = 896
+
+    x_max = int(screen_w * OPEN_ENTRY_REGION_X_MAX_RATIO)
+    y_max = int(screen_h * OPEN_ENTRY_REGION_Y_MAX_RATIO)
+    y_min = int(screen_h * POPUP_REGION_Y_MIN_RATIO)
+    keyword_list = list(keywords) if keywords is not None else None
+    type_set = set(element_types)
+
+    out: list[Hit] = []
+    for el in root.iter():
+        t = (el.attrib.get("type") or "").strip()
+        if t not in type_set:
+            continue
+        visible_attr = str(el.attrib.get("visible") or "").strip().lower()
+        if visible_attr and visible_attr not in ("1", "true", "yes"):
+            continue
+
+        x = _to_int(el.attrib.get("x"), 0)
+        y = _to_int(el.attrib.get("y"), 0)
+        w = _to_int(el.attrib.get("width"), 0)
+        h = _to_int(el.attrib.get("height"), 0)
+        if w < 4 or h < 4:
+            continue
+        cx = int(x + w / 2)
+        cy = int(y + h / 2)
+
+        if upper_left_only and (cx > x_max or cy > y_max):
+            continue
+        if lower_half_only and cy < y_min:
+            continue
+
+        text = (el.attrib.get("name") or el.attrib.get("label") or el.attrib.get("value") or "").strip()
+        if not text:
+            continue
+        if keyword_list is not None and not any(k in text for k in keyword_list):
+            continue
+
+        out.append(Hit(text=text, x=cx, y=cy, source="src"))
+    return out
+
+
 def pick_best_hit(hits: list[Hit], keyword_priority: list[str]) -> Optional[Hit]:
     if not hits:
         return None
@@ -344,7 +428,58 @@ def filter_hits_to_open_entry_region(driver: webdriver.Remote, hits: list[Hit]) 
     return [h for h in hits if 0 <= h.x <= x_max and 0 <= h.y <= y_max]
 
 
+def configure_open_entry_lookup(cache_ttl_seconds: float, ocr_cooldown_seconds: float) -> None:
+    global _open_entry_cache_ttl_seconds, _open_entry_ocr_cooldown_seconds
+    _open_entry_cache_ttl_seconds = max(1.0, float(cache_ttl_seconds))
+    _open_entry_ocr_cooldown_seconds = max(0.0, float(ocr_cooldown_seconds))
+
+
+def invalidate_open_entry_cache() -> None:
+    global _open_entry_cache_hit, _open_entry_cache_ts
+    _open_entry_cache_hit = None
+    _open_entry_cache_ts = 0.0
+
+
+def _cache_open_entry_hit(hit: Hit) -> None:
+    global _open_entry_cache_hit, _open_entry_cache_ts
+    _open_entry_cache_hit = Hit(text=hit.text, x=hit.x, y=hit.y, source=hit.source)
+    _open_entry_cache_ts = time.time()
+
+
+def _get_cached_open_entry_hit() -> Optional[Hit]:
+    if _open_entry_cache_hit is None:
+        return None
+    if time.time() - _open_entry_cache_ts > _open_entry_cache_ttl_seconds:
+        return None
+    return Hit(
+        text=_open_entry_cache_hit.text or "福袋",
+        x=_open_entry_cache_hit.x,
+        y=_open_entry_cache_hit.y,
+        source="cache",
+    )
+
+
 def find_open_entry_hit(driver: webdriver.Remote, ocr_engine: Optional[RapidOCR]) -> Optional[Hit]:
+    global _open_entry_next_ocr_ts
+    cached_hit = _get_cached_open_entry_hit()
+    if cached_hit is not None:
+        return cached_hit
+
+    source_open_hits = filter_short_hits(
+        source_hits(
+            driver,
+            OPEN_ENTRY_ELEMENT_TYPES,
+            keywords=OPEN_KEYWORDS,
+            upper_left_only=True,
+        ),
+        max_len=8,
+    )
+    source_open_hits = [h for h in source_open_hits if _is_valid_open_text(h.text)]
+    hit = pick_best_hit(source_open_hits, OPEN_KEYWORDS)
+    if hit is not None:
+        _cache_open_entry_hit(hit)
+        return hit
+
     native_hits = filter_short_hits(
         native_candidates(driver, OPEN_KEYWORDS, element_types=OPEN_ENTRY_ELEMENT_TYPES),
         max_len=8,
@@ -353,15 +488,22 @@ def find_open_entry_hit(driver: webdriver.Remote, ocr_engine: Optional[RapidOCR]
     native_hits = filter_hits_to_open_entry_region(driver, native_hits)
     hit = pick_best_hit(native_hits, OPEN_KEYWORDS)
     if hit is not None:
+        _cache_open_entry_hit(hit)
         return hit
 
     if ocr_engine is None:
+        return None
+    if time.time() < _open_entry_next_ocr_ts:
         return None
 
     ocr_hits = filter_short_hits(ocr_candidates(driver, ocr_engine, OPEN_KEYWORDS), max_len=8)
     ocr_hits = [h for h in ocr_hits if _is_valid_open_text(h.text)]
     ocr_hits = filter_hits_to_open_entry_region(driver, ocr_hits)
-    return pick_best_hit(ocr_hits, OPEN_KEYWORDS)
+    _open_entry_next_ocr_ts = time.time() + _open_entry_ocr_cooldown_seconds
+    hit = pick_best_hit(ocr_hits, OPEN_KEYWORDS)
+    if hit is not None:
+        _cache_open_entry_hit(hit)
+    return hit
 
 
 def screenshot_np(driver: webdriver.Remote) -> np.ndarray:
@@ -419,6 +561,16 @@ def unique_texts(texts: list[str]) -> list[str]:
 
 
 def visible_texts_raw(driver: webdriver.Remote, lower_half_only: bool = False) -> list[str]:
+    source_text_hits = source_hits(
+        driver,
+        ("XCUIElementTypeStaticText", "XCUIElementTypeButton"),
+        keywords=None,
+        upper_left_only=False,
+        lower_half_only=lower_half_only,
+    )
+    if source_text_hits:
+        return [h.text for h in source_text_hits if (h.text or "").strip()]
+
     try:
         elements = driver.find_elements(
             AppiumBy.IOS_PREDICATE,
@@ -683,6 +835,9 @@ def detect_draw_result(texts: list[str]) -> Optional[str]:
     left = parse_popup_draw_countdown_seconds(texts)
     if left is None:
         left = parse_countdown_seconds(texts)
+    # Guard: do not settle win/lose while countdown is still running.
+    if left is not None and left > 1:
+        return None
     # Guard: do not treat lose as final result while countdown is still running.
     lose_allowed = (left is None) or (left <= 1)
     if lose_allowed and any(k in joined for k in RESULT_LOSE_KEYWORDS):
@@ -719,7 +874,7 @@ def is_low_value_long_countdown_popup(texts: list[str]) -> bool:
     val = parse_reference_value_yuan(texts)
     if val is None:
         return False
-    return val < 100.0
+    return val < 500.0
 
 
 def is_luckybag_popup_visible(texts: list[str]) -> bool:
@@ -808,6 +963,7 @@ def dismiss_overlays(driver: webdriver.Remote, ocr_engine: Optional[RapidOCR], r
 
 
 def switch_room_hard(driver: webdriver.Remote, ocr_engine: Optional[RapidOCR], post_wait: float) -> None:
+    invalidate_open_entry_cache()
     dismiss_overlays(driver, ocr_engine, rounds=4)
     size = driver.get_window_size()
     tap(driver, int(size["width"] * 0.5), int(size["height"] * 0.38))
@@ -825,20 +981,45 @@ def try_open_popup_recheck_before_switch(
     ocr_engine: Optional[RapidOCR],
     reason: str,
 ) -> bool:
+    def _collect_popup_after_tap(x: int, y: int, tag: str) -> list[str]:
+        log(f"Pre-switch recheck tap OPEN ({tag}) @ ({x},{y})")
+        tap(driver, x, y)
+        time.sleep(0.55)
+        return merged_scene_texts(driver, ocr_engine, prefer_ocr_for_popup=True, popup_lower_half=True)
+
     log(f"Pre-switch recheck ({reason}): try opening lucky-bag popup once.")
     open_hit = find_open_entry_hit(driver, ocr_engine)
-    if open_hit is None:
-        log("Pre-switch recheck: no lucky-bag entry found.")
-        return False
+    popup_texts: list[str] = []
+    if open_hit is not None:
+        popup_texts = _collect_popup_after_tap(
+            open_hit.x,
+            open_hit.y,
+            f"{open_hit.source}:{open_hit.text}",
+        )
+        if not is_luckybag_popup_visible(popup_texts):
+            log("Pre-switch recheck: popup not visible after open-hit tap.")
+            popup_texts = []
+    else:
+        log("Pre-switch recheck: no lucky-bag entry found from detector.")
 
-    log(f"Pre-switch recheck tap OPEN ({open_hit.source}) -> '{open_hit.text}' @ ({open_hit.x},{open_hit.y})")
-    tap(driver, open_hit.x, open_hit.y)
-    time.sleep(0.55)
-
-    popup_texts = merged_scene_texts(driver, ocr_engine, prefer_ocr_for_popup=True, popup_lower_half=True)
-    if not is_luckybag_popup_visible(popup_texts):
-        log("Pre-switch recheck: popup not visible after open tap.")
-        return False
+    # Fallback: when entry detection fails, try deterministic left-top taps where
+    # lucky-bag entry commonly appears in live rooms.
+    if not popup_texts:
+        size = driver.get_window_size()
+        fallback_points = [
+            (int(size["width"] * 0.17), int(size["height"] * 0.16)),
+            (int(size["width"] * 0.33), int(size["height"] * 0.16)),
+            (int(size["width"] * 0.23), int(size["height"] * 0.22)),
+        ]
+        for idx, (fx, fy) in enumerate(fallback_points, start=1):
+            candidate_texts = _collect_popup_after_tap(fx, fy, f"fallback#{idx}")
+            if is_luckybag_popup_visible(candidate_texts):
+                popup_texts = candidate_texts
+                log(f"Pre-switch recheck: popup visible via fallback tap#{idx}.")
+                break
+        if not popup_texts:
+            log("Pre-switch recheck: popup still not visible after fallback taps.")
+            return False
 
     if is_diamond_luckybag_popup(popup_texts):
         log("Pre-switch recheck: diamond popup detected, keep switch decision.")
@@ -1036,6 +1217,31 @@ def run_task_panel_actions(
     return taps, still_unfinished
 
 
+def try_task_actions_during_active_countdown(
+    driver: webdriver.Remote,
+    ocr_engine: Optional[RapidOCR],
+    last_try_ts: float,
+    min_interval: float = 8.0,
+) -> tuple[int, float]:
+    now = time.time()
+    if now - last_try_ts < min_interval:
+        return 0, last_try_ts
+
+    popup_texts = merged_scene_texts(driver, ocr_engine, prefer_ocr_for_popup=True, popup_lower_half=True)
+    if not (has_popup_draw_anchor(popup_texts) or has_task_success_cta_text(popup_texts)):
+        return 0, last_try_ts
+
+    joined = " | ".join(popup_texts)
+    should_try = has_unfinished_task_text(driver, ocr_engine) or any(
+        k in joined for k in ("一键发表评论", "加入粉丝团", "加入粉丝")
+    )
+    if not should_try:
+        return 0, now
+
+    taps, _ = run_task_panel_actions(driver, ocr_engine, rounds=4)
+    return taps, now
+
+
 # ---- Draw wait ----
 
 def wait_countdown_and_check_result(
@@ -1077,7 +1283,14 @@ def wait_countdown_and_check_result(
 
         texts = merged_scene_texts(driver, ocr_engine, prefer_ocr_for_popup=True, popup_lower_half=True)
         result = detect_draw_result(texts)
-        if result is not None:
+        if result == "win":
+            confirm_texts = unique_texts(visible_texts_raw(driver, lower_half_only=True))
+            confirm_result = detect_draw_result(confirm_texts)
+            if confirm_result == "win":
+                log("Draw result detected: win (confirmed by native texts).")
+                return "win"
+            log("Win signal not confirmed by native texts, continue waiting.")
+        elif result is not None:
             log(f"Draw result detected: {result}")
             return result
 
@@ -1087,7 +1300,11 @@ def wait_countdown_and_check_result(
         if left is not None:
             countdown_found = True
             target = time.time() + left + timer_offset_seconds
-            if countdown_target_ts is None or target > countdown_target_ts:
+            if left <= 1:
+                # Countdown reaches zero frequently before result text appears.
+                # Force an immediate probe instead of waiting for an older, longer target.
+                countdown_target_ts = time.time()
+            elif countdown_target_ts is None or target > countdown_target_ts:
                 countdown_target_ts = target
             # Once countdown is known, extend wait window to at least countdown target.
             if countdown_target_ts > dynamic_deadline:
@@ -1128,7 +1345,14 @@ def wait_countdown_and_check_result(
 
                 probe_texts = visible_texts_raw(driver, lower_half_only=True)
                 probe_result = detect_draw_result(probe_texts)
-                if probe_result is not None:
+                if probe_result == "win":
+                    confirm_texts = unique_texts(visible_texts_raw(driver, lower_half_only=True))
+                    confirm_result = detect_draw_result(confirm_texts)
+                    if confirm_result == "win":
+                        log("Draw result detected after timer: win (confirmed by native texts).")
+                        return "win"
+                    log("Post-timer win signal not confirmed by native texts.")
+                elif probe_result is not None:
                     log(f"Draw result detected after timer: {probe_result}")
                     return probe_result
                 time.sleep(max(0.3, poll_interval))
@@ -1171,6 +1395,10 @@ def handle_post_join_draw_flow(
         log("Draw result is lose. Close popup(s) and switch to next room.")
         switch_room_hard(driver, ocr_engine, post_wait=post_swipe_wait)
         return "lose"
+    if result == "unknown_after_countdown":
+        log("Countdown ended but no explicit result text. Treat as stale popup and switch to next room.")
+        switch_room_hard(driver, ocr_engine, post_wait=post_swipe_wait)
+        return "switched"
     log("Draw result unknown. Stay in current room and keep monitoring.")
     return "unknown"
 
@@ -1214,6 +1442,8 @@ def main() -> int:
     parser.add_argument("--room-stall-seconds", type=float, default=45.0)
     parser.add_argument("--max-collapse-reopen-rounds", type=int, default=2)
     parser.add_argument("--max-unfinished-rounds", type=int, default=2)
+    parser.add_argument("--open-entry-cache-ttl-seconds", type=float, default=20.0)
+    parser.add_argument("--open-entry-ocr-cooldown-seconds", type=float, default=2.5)
 
     parser.add_argument("--wda-launch-timeout-ms", type=int, default=120000)
     parser.add_argument("--wda-connection-timeout-ms", type=int, default=120000)
@@ -1231,6 +1461,11 @@ def main() -> int:
             raise RuntimeError("Cannot auto-detect iOS real-device UDID. Pass --udid explicitly.")
         args.udid = detected
         log(f"Auto-detected UDID: {args.udid}")
+
+    configure_open_entry_lookup(
+        cache_ttl_seconds=args.open_entry_cache_ttl_seconds,
+        ocr_cooldown_seconds=args.open_entry_ocr_cooldown_seconds,
+    )
 
     ocr_engine = RapidOCR() if RapidOCR is not None else None
     if ocr_engine is None:
@@ -1300,6 +1535,7 @@ def main() -> int:
 
     room_enter_ts = time.time()
     last_progress_ts = time.time()
+    last_countdown_task_try_ts = 0.0
 
     try:
         log("Started. Please manually stay in target live room.")
@@ -1331,7 +1567,7 @@ def main() -> int:
                 )
                 if draw_outcome == "win":
                     return 0
-                if draw_outcome == "lose":
+                if draw_outcome in ("lose", "switched"):
                     last_swipe_ts = time.time()
                     open_retry_count = 0
                     no_open_rounds = 0
@@ -1377,6 +1613,13 @@ def main() -> int:
                 and time.time() - last_swipe_ts >= args.blocked_swipe_cooldown
             ):
                 if has_active_draw_countdown(driver, ocr_engine):
+                    task_taps, last_countdown_task_try_ts = try_task_actions_during_active_countdown(
+                        driver,
+                        ocr_engine,
+                        last_countdown_task_try_ts,
+                    )
+                    if task_taps > 0:
+                        log(f"Countdown branch task taps: {task_taps}")
                     log("Room stall check skipped: active draw countdown detected.")
                     last_progress_ts = time.time()
                     time.sleep(random.uniform(args.interval_min, args.interval_max))
@@ -1432,6 +1675,13 @@ def main() -> int:
                 no_open_rounds += 1
                 if no_open_rounds >= 1 and time.time() - last_swipe_ts >= args.blocked_swipe_cooldown:
                     if has_active_draw_countdown(driver, ocr_engine):
+                        task_taps, last_countdown_task_try_ts = try_task_actions_during_active_countdown(
+                            driver,
+                            ocr_engine,
+                            last_countdown_task_try_ts,
+                        )
+                        if task_taps > 0:
+                            log(f"Countdown branch task taps: {task_taps}")
                         log("No-open switch skipped: active draw countdown detected.")
                         last_progress_ts = time.time()
                         time.sleep(random.uniform(args.interval_min, args.interval_max))
@@ -1531,7 +1781,7 @@ def main() -> int:
 
             if is_low_value_long_countdown_popup(popup_texts):
                 ref_val = parse_reference_value_yuan(popup_texts)
-                log(f"Physical bag filtered (countdown={popup_left}s, ref={ref_val}元 < 100), switch to next room.")
+                log(f"Physical bag filtered (countdown={popup_left}s, ref={ref_val}元 < 500), switch to next room.")
                 switch_room_hard(driver, ocr_engine, post_wait=args.post_swipe_wait)
                 last_swipe_ts = time.time()
                 open_retry_count = 0
@@ -1586,7 +1836,7 @@ def main() -> int:
                 )
                 if draw_outcome == "win":
                     return 0
-                if draw_outcome == "lose":
+                if draw_outcome in ("lose", "switched"):
                     last_swipe_ts = time.time()
                     open_retry_count = 0
                     no_open_rounds = 0
@@ -1609,7 +1859,7 @@ def main() -> int:
                 )
                 if draw_outcome == "win":
                     return 0
-                if draw_outcome == "lose":
+                if draw_outcome in ("lose", "switched"):
                     last_swipe_ts = time.time()
                     open_retry_count = 0
                     no_open_rounds = 0
