@@ -231,8 +231,6 @@ POPULARITY_POPUP_KEYWORDS = [
     "销量榜",
     "商品榜",
     "热销榜",
-    "榜单",
-    "本场",
     "小时榜",
     "热榜",
     "贡献榜",
@@ -330,6 +328,9 @@ def build_driver(
     wda_startup_retry_interval_ms: int = 15000,
     wait_for_idle_timeout: float = 0.0,
     wait_for_quiescence: bool = False,
+    wda_local_port: Optional[int] = None,
+    mjpeg_server_port: Optional[int] = None,
+    derived_data_path: Optional[str] = None,
 ) -> webdriver.Remote:
     opts = XCUITestOptions()
     opts.platform_name = "iOS"
@@ -357,6 +358,12 @@ def build_driver(
     opts.set_capability("wdaStartupRetryInterval", int(wda_startup_retry_interval_ms))
     opts.set_capability("waitForIdleTimeout", float(wait_for_idle_timeout))
     opts.set_capability("waitForQuiescence", bool(wait_for_quiescence))
+    if wda_local_port is not None:
+        opts.set_capability("wdaLocalPort", int(wda_local_port))
+    if mjpeg_server_port is not None:
+        opts.set_capability("mjpegServerPort", int(mjpeg_server_port))
+    if derived_data_path:
+        opts.set_capability("derivedDataPath", derived_data_path)
 
     return webdriver.Remote(appium_url, options=opts)
 
@@ -690,15 +697,30 @@ def ocr_candidates(driver: webdriver.Remote, ocr_engine: RapidOCR, keywords: Ite
     return out
 
 
-def ocr_texts(driver: webdriver.Remote, ocr_engine: RapidOCR, min_score: float = 0.45) -> list[str]:
+def ocr_texts(
+    driver: webdriver.Remote,
+    ocr_engine: RapidOCR,
+    min_score: float = 0.45,
+    lower_half_only: bool = False,
+) -> list[str]:
     img = screenshot_np(driver)
+    h = int(img.shape[0]) if img is not None and len(img.shape) >= 2 else 0
+    y_min = int(h * POPUP_REGION_Y_MIN_RATIO) if lower_half_only else 0
     result, _ = ocr_engine(img)
     if not result:
         return []
     out: list[str] = []
-    for _, text, score in result:
+    for box, text, score in result:
         s = float(score) if score is not None else 0.0
         t = str(text).strip() if text is not None else ""
+        if lower_half_only:
+            try:
+                ys = [int(p[1]) for p in box]
+                cy = int(sum(ys) / len(ys))
+                if cy < y_min:
+                    continue
+            except Exception:
+                continue
         if t and s >= min_score:
             out.append(t)
     return out
@@ -783,7 +805,11 @@ def merged_scene_texts(
     if not need_ocr:
         return texts
 
-    ocr_ts = ocr_texts(driver, ocr_engine)
+    ocr_ts = ocr_texts(
+        driver,
+        ocr_engine,
+        lower_half_only=(prefer_ocr_for_popup and popup_lower_half),
+    )
     if prefer_ocr_for_popup:
         return texts + ocr_ts
     return unique_texts(texts + ocr_ts)
@@ -1045,7 +1071,7 @@ def classify_reference_value_filter(texts: list[str]) -> Optional[str]:
     left = parse_popup_draw_countdown_seconds(texts)
     if left is None:
         left = parse_countdown_seconds(texts)
-    if left is not None and left > 300 and val < 100.0:
+    if left is not None and left > 240 and val < 500.0:
         return "low-value-long-countdown"
     return None
 
@@ -1092,11 +1118,9 @@ def has_popularity_popup(
     driver: webdriver.Remote,
     ocr_engine: Optional[RapidOCR],
 ) -> bool:
-    if native_candidates(driver, POPULARITY_POPUP_KEYWORDS):
-        return True
-    if ocr_engine is not None and ocr_candidates(driver, ocr_engine, POPULARITY_POPUP_KEYWORDS):
-        return True
-    texts = merged_scene_texts(driver, ocr_engine, prefer_ocr_for_popup=True, popup_lower_half=False)
+    # Restrict detection to lower-half popup region so top-left live badges
+    # (e.g. "小时榜", "本场点赞") do not trigger false popup dismiss flow.
+    texts = merged_scene_texts(driver, ocr_engine, prefer_ocr_for_popup=True, popup_lower_half=True)
     return is_popularity_board_popup(texts)
 
 
@@ -1143,8 +1167,12 @@ def swipe_to_next_room(driver: webdriver.Remote, duration: float = 0.35) -> None
     # Strict vertical swipe on center line (fromX == toX) to avoid any
     # horizontal edge-gesture ambiguity.
     x = int(size["width"] * 0.50)
-    start_y = int(size["height"] * 0.78)
-    end_y = int(size["height"] * 0.22)
+    # Start from the visual center to avoid touching the public-comment area.
+    start_y = int(size["height"] * 0.50)
+    # Keep the previous swipe distance (0.56 * height) but clamp near top edge.
+    swipe_distance = int(size["height"] * 0.56)
+    top_guard = int(size["height"] * 0.05)
+    end_y = max(top_guard, start_y - swipe_distance)
     driver.execute_script(
         "mobile: dragFromToForDuration",
         {
@@ -1279,9 +1307,10 @@ def switch_room_hard(
     time.sleep(0.15)
     for idx, duration in enumerate((0.40, 0.46, 0.52), start=1):
         swipe_to_next_room(driver, duration=duration)
+        # Keep one swipe per attempt; double-swipe here can skip two rooms.
         time.sleep(0.20)
-        swipe_to_next_room(driver, duration=duration)
-        wait_seconds = 3.0 + random.uniform(0.0, 2.0)
+        base_post_wait = max(5.0, float(post_wait))
+        wait_seconds = base_post_wait + random.uniform(0.0, 2.0)
         log(f"Post-swipe wait: {wait_seconds:.2f}s (attempt {idx})")
         time.sleep(wait_seconds)
         after_fp = room_fingerprint(driver)
@@ -2011,7 +2040,7 @@ def main() -> int:
 
     parser.add_argument("--blocked-swipe-cooldown", type=float, default=4.0)
     parser.add_argument("--open-retry-before-swipe", type=int, default=5)
-    parser.add_argument("--post-swipe-wait", type=float, default=3.0)
+    parser.add_argument("--post-swipe-wait", type=float, default=5.0)
 
     parser.add_argument("--draw-countdown-grace", type=float, default=2.0)
     parser.add_argument("--draw-poll-interval", type=float, default=1.0)
@@ -2031,6 +2060,9 @@ def main() -> int:
     parser.add_argument("--wda-startup-retry-interval-ms", type=int, default=15000)
     parser.add_argument("--wait-for-idle-timeout", type=float, default=0.0)
     parser.add_argument("--wait-for-quiescence", action="store_true", default=False)
+    parser.add_argument("--wda-local-port", type=int, default=None)
+    parser.add_argument("--mjpeg-server-port", type=int, default=None)
+    parser.add_argument("--derived-data-path", default=None)
 
     args = parser.parse_args()
 
@@ -2070,6 +2102,9 @@ def main() -> int:
             wda_startup_retry_interval_ms=args.wda_startup_retry_interval_ms,
             wait_for_idle_timeout=args.wait_for_idle_timeout,
             wait_for_quiescence=args.wait_for_quiescence,
+            wda_local_port=args.wda_local_port,
+            mjpeg_server_port=args.mjpeg_server_port,
+            derived_data_path=args.derived_data_path,
         )
     except Exception as e:
         msg = str(e)
@@ -2095,6 +2130,9 @@ def main() -> int:
             wda_startup_retry_interval_ms=max(20000, args.wda_startup_retry_interval_ms),
             wait_for_idle_timeout=args.wait_for_idle_timeout,
             wait_for_quiescence=args.wait_for_quiescence,
+            wda_local_port=args.wda_local_port,
+            mjpeg_server_port=args.mjpeg_server_port,
+            derived_data_path=args.derived_data_path,
         )
 
     end_at = (time.time() + args.max_minutes * 60) if args.max_minutes > 0 else None
@@ -2405,7 +2443,7 @@ def main() -> int:
             if popup_countdown_unreadable:
                 log("Lucky-bag popup countdown unreadable, try task actions first.")
 
-            if popup_left is not None and popup_left > 300:
+            if popup_left is not None and popup_left > 240:
                 ref_dbg = parse_reference_value_yuan(popup_texts)
                 log(f"Long-countdown popup detected (countdown={popup_left}s, ref={ref_dbg}元).")
 
@@ -2415,7 +2453,7 @@ def main() -> int:
                 if value_filter_reason == "low-value-under-10":
                     log(f"Physical bag filtered (ref={ref_val}元 < 10), switch to next room.")
                 else:
-                    log(f"Physical bag filtered (countdown={popup_left}s, ref={ref_val}元; >5m && <100), switch to next room.")
+                    log(f"Physical bag filtered (countdown={popup_left}s, ref={ref_val}元; >4m && <500), switch to next room.")
                 switched = switch_room_hard(
                     driver,
                     ocr_engine,
