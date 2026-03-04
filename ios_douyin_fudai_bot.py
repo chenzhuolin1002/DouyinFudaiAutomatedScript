@@ -58,6 +58,7 @@ TASK_ACTION_TEXT_KEYWORDS = [
     "去完成",
     "去参与",
     "立即参与",
+    "参与抽奖",
     "参与",
     "去评论",
     "发表评论",
@@ -104,6 +105,7 @@ STRICT_TASK_ACTION_TEXT_KEYWORDS = [
     "去完成",
     "去参与",
     "立即参与",
+    "参与抽奖",
 ]
 
 TASK_ACTION_BLOCKLIST = [
@@ -1501,7 +1503,7 @@ def try_open_popup_recheck_before_switch(
     # actionable tasks (e.g. 一键发表评论 / 加入粉丝团) before switching rooms.
     joined = " | ".join(popup_texts)
     should_try_tasks = has_unfinished_task_text(driver, ocr_engine) or any(
-        k in joined for k in ("一键发表评论", "加入粉丝团", "加入粉丝", "去参与", "立即参与")
+        k in joined for k in ("一键发表评论", "加入粉丝团", "加入粉丝", "去参与", "立即参与", "参与抽奖")
     )
     if should_try_tasks:
         taps, still_unfinished, fans_confirmed = run_task_panel_actions(driver, ocr_engine, rounds=4)
@@ -1829,7 +1831,7 @@ def try_task_actions_during_active_countdown(
 
     joined = " | ".join(popup_texts)
     should_try = has_unfinished_task_text(driver, ocr_engine) or any(
-        k in joined for k in ("一键发表评论", "加入粉丝团", "加入粉丝")
+        k in joined for k in ("一键发表评论", "加入粉丝团", "加入粉丝", "去参与", "立即参与", "参与抽奖")
     )
     if not should_try:
         return 0, now
