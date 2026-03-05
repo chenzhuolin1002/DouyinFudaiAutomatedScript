@@ -1488,6 +1488,8 @@ def try_open_popup_recheck_before_switch(
             dedup.append((x, y))
             if len(dedup) >= 6:
                 break
+        if len(dedup) >= 2:
+            dedup[0], dedup[1] = dedup[1], dedup[0]
         return dedup
 
     log(f"Pre-switch recheck ({reason}): light detector + quick-probe check.")
