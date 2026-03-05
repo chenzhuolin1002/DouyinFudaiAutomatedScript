@@ -66,6 +66,12 @@ TASK_ACTION_TEXT_KEYWORDS = [
     "去领取",
 ]
 
+COMMENT_TASK_KEYWORDS = [
+    "一键发表评论",
+    "发表评论",
+    "去评论",
+]
+
 FANS_GROUP_CTA_KEYWORDS = [
     "一键加入粉丝团",
     "去加入粉丝团",
@@ -265,6 +271,15 @@ POPUP_REGION_Y_MIN_RATIO = 0.50
 OPEN_ENTRY_CACHE_TTL_SECONDS = 20.0
 OPEN_ENTRY_OCR_COOLDOWN_SECONDS = 2.5
 OPEN_FALLBACK_MAX_POPULARITY_HITS = 3
+OPEN_FALLBACK_LINE_X_RATIOS = (0.14, 0.18, 0.22, 0.26, 0.30, 0.34, 0.38)
+OPEN_FALLBACK_LINE_MAX_POINTS = 9
+SWITCH_SWIPE_PROFILES = (
+    # duration, start_y_ratio, distance_ratio
+    (0.40, 0.58, 0.62),
+    (0.46, 0.62, 0.68),
+    (0.52, 0.66, 0.74),
+)
+SWITCH_SWIPE_TOP_GUARD_RATIO = 0.03
 
 
 # ---- Models ----
@@ -286,6 +301,7 @@ _open_entry_cache_ts: float = 0.0
 _open_entry_next_ocr_ts: float = 0.0
 _open_entry_cache_ttl_seconds: float = OPEN_ENTRY_CACHE_TTL_SECONDS
 _open_entry_ocr_cooldown_seconds: float = OPEN_ENTRY_OCR_COOLDOWN_SECONDS
+_open_entry_success_line_y: Optional[int] = None
 
 def log(msg: str) -> None:
     print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
@@ -596,6 +612,16 @@ def _cache_open_entry_hit(hit: Hit) -> None:
     _open_entry_cache_ts = time.time()
 
 
+def remember_open_entry_success_line(y: int, source: str) -> None:
+    global _open_entry_success_line_y
+    yy = int(y)
+    if yy <= 0:
+        return
+    if _open_entry_success_line_y is None:
+        _open_entry_success_line_y = yy
+        log(f"Lock OPEN success line y={yy} ({source}).")
+
+
 def _get_cached_open_entry_hit() -> Optional[Hit]:
     if _open_entry_cache_hit is None:
         return None
@@ -611,13 +637,25 @@ def _get_cached_open_entry_hit() -> Optional[Hit]:
     )
 
 
-def find_open_entry_hit(driver: webdriver.Remote, ocr_engine: Optional[RapidOCR]) -> Optional[Hit]:
+def find_open_entry_hit(
+    driver: webdriver.Remote,
+    ocr_engine: Optional[RapidOCR],
+    debug_context: Optional[str] = None,
+) -> Optional[Hit]:
     global _open_entry_next_ocr_ts
-    cached_hit = _get_cached_open_entry_hit()
-    if cached_hit is not None and is_safe_open_entry_point(driver, cached_hit.x, cached_hit.y):
-        return cached_hit
 
-    source_open_hits = filter_short_hits(
+    def _dlog(msg: str) -> None:
+        if debug_context:
+            log(f"[OPEN-DETECT {debug_context}] {msg}")
+
+    cached_hit = _get_cached_open_entry_hit()
+    if cached_hit is not None:
+        if is_safe_open_entry_point(driver, cached_hit.x, cached_hit.y):
+            _dlog(f"cache hit -> ({cached_hit.x},{cached_hit.y})")
+            return cached_hit
+        _dlog(f"cache hit unsafe -> ({cached_hit.x},{cached_hit.y})")
+
+    source_hits_raw = filter_short_hits(
         source_hits(
             driver,
             OPEN_ENTRY_ELEMENT_TYPES,
@@ -626,39 +664,65 @@ def find_open_entry_hit(driver: webdriver.Remote, ocr_engine: Optional[RapidOCR]
         ),
         max_len=16,
     )
-    source_open_hits = [h for h in source_open_hits if _is_valid_open_text(h.text)]
-    source_open_hits = filter_hits_to_open_entry_region(driver, source_open_hits)
-    source_open_hits = filter_hits_by_open_entry_shape(driver, source_open_hits)
+    source_valid_text_hits = [h for h in source_hits_raw if _is_valid_open_text(h.text)]
+    source_region_hits = filter_hits_to_open_entry_region(driver, source_valid_text_hits)
+    source_open_hits = filter_hits_by_open_entry_shape(driver, source_region_hits)
+    if debug_context:
+        _dlog(
+            "source pipeline "
+            f"raw={len(source_hits_raw)} valid_text={len(source_valid_text_hits)} "
+            f"region={len(source_region_hits)} shape={len(source_open_hits)}"
+        )
     hit = pick_best_open_entry_hit(source_open_hits, OPEN_KEYWORDS)
     if hit is not None:
         _cache_open_entry_hit(hit)
+        _dlog(f"source selected -> '{hit.text}' @ ({hit.x},{hit.y})")
         return hit
 
-    native_hits = filter_short_hits(
+    native_hits_raw = filter_short_hits(
         native_candidates(driver, OPEN_KEYWORDS, element_types=OPEN_ENTRY_ELEMENT_TYPES),
         max_len=16,
     )
-    native_hits = [h for h in native_hits if _is_valid_open_text(h.text)]
-    native_hits = filter_hits_to_open_entry_region(driver, native_hits)
-    native_hits = filter_hits_by_open_entry_shape(driver, native_hits)
+    native_valid_text_hits = [h for h in native_hits_raw if _is_valid_open_text(h.text)]
+    native_region_hits = filter_hits_to_open_entry_region(driver, native_valid_text_hits)
+    native_hits = filter_hits_by_open_entry_shape(driver, native_region_hits)
+    if debug_context:
+        _dlog(
+            "native pipeline "
+            f"raw={len(native_hits_raw)} valid_text={len(native_valid_text_hits)} "
+            f"region={len(native_region_hits)} shape={len(native_hits)}"
+        )
     hit = pick_best_open_entry_hit(native_hits, OPEN_KEYWORDS)
     if hit is not None:
         _cache_open_entry_hit(hit)
+        _dlog(f"native selected -> '{hit.text}' @ ({hit.x},{hit.y})")
         return hit
 
     if ocr_engine is None:
+        _dlog("ocr skipped: engine unavailable")
         return None
     if time.time() < _open_entry_next_ocr_ts:
+        remain = max(0.0, _open_entry_next_ocr_ts - time.time())
+        _dlog(f"ocr skipped: cooldown {remain:.2f}s")
         return None
 
-    ocr_hits = filter_short_hits(ocr_candidates(driver, ocr_engine, OPEN_KEYWORDS), max_len=16)
-    ocr_hits = [h for h in ocr_hits if _is_valid_open_text(h.text)]
-    ocr_hits = filter_hits_to_open_entry_region(driver, ocr_hits)
-    ocr_hits = filter_hits_by_open_entry_shape(driver, ocr_hits)
+    ocr_hits_raw = filter_short_hits(ocr_candidates(driver, ocr_engine, OPEN_KEYWORDS), max_len=16)
+    ocr_valid_text_hits = [h for h in ocr_hits_raw if _is_valid_open_text(h.text)]
+    ocr_region_hits = filter_hits_to_open_entry_region(driver, ocr_valid_text_hits)
+    ocr_hits = filter_hits_by_open_entry_shape(driver, ocr_region_hits)
+    if debug_context:
+        _dlog(
+            "ocr pipeline "
+            f"raw={len(ocr_hits_raw)} valid_text={len(ocr_valid_text_hits)} "
+            f"region={len(ocr_region_hits)} shape={len(ocr_hits)}"
+        )
     _open_entry_next_ocr_ts = time.time() + _open_entry_ocr_cooldown_seconds
     hit = pick_best_open_entry_hit(ocr_hits, OPEN_KEYWORDS)
     if hit is not None:
         _cache_open_entry_hit(hit)
+        _dlog(f"ocr selected -> '{hit.text}' @ ({hit.x},{hit.y})")
+    else:
+        _dlog("miss: no candidate selected")
     return hit
 
 
@@ -1164,17 +1228,27 @@ def is_risky_overlay_close_hit(driver: webdriver.Remote, hit: Hit) -> bool:
 
 # ---- UI actions ----
 
-def swipe_to_next_room(driver: webdriver.Remote, duration: float = 0.35) -> None:
+def swipe_to_next_room(
+    driver: webdriver.Remote,
+    duration: float = 0.35,
+    start_y_ratio: float = 0.50,
+    distance_ratio: float = 0.56,
+) -> tuple[int, int, int, int]:
     size = driver.get_window_size()
     # Strict vertical swipe on center line (fromX == toX) to avoid any
     # horizontal edge-gesture ambiguity.
     x = int(size["width"] * 0.50)
-    # Start from the visual center to avoid touching the public-comment area.
-    start_y = int(size["height"] * 0.50)
-    # Keep the previous swipe distance (0.56 * height) but clamp near top edge.
-    swipe_distance = int(size["height"] * 0.56)
-    top_guard = int(size["height"] * 0.05)
+    h = int(size["height"])
+    start_ratio = max(0.35, min(0.80, float(start_y_ratio)))
+    dist_ratio = max(0.30, min(0.90, float(distance_ratio)))
+    start_y = int(h * start_ratio)
+    swipe_distance = int(h * dist_ratio)
+    top_guard = int(h * SWITCH_SWIPE_TOP_GUARD_RATIO)
     end_y = max(top_guard, start_y - swipe_distance)
+    # Ensure a meaningful swipe travel to reduce room-bounce risk.
+    min_travel = int(h * 0.24)
+    if start_y - end_y < min_travel:
+        end_y = max(top_guard, start_y - min_travel)
     driver.execute_script(
         "mobile: dragFromToForDuration",
         {
@@ -1185,6 +1259,7 @@ def swipe_to_next_room(driver: webdriver.Remote, duration: float = 0.35) -> None
             "toY": end_y,
         },
     )
+    return x, start_y, x, end_y
 
 
 def room_fingerprint(driver: webdriver.Remote) -> tuple[str, ...]:
@@ -1307,8 +1382,17 @@ def switch_room_hard(
     size = driver.get_window_size()
     tap(driver, int(size["width"] * 0.5), int(size["height"] * 0.38))
     time.sleep(0.15)
-    for idx, duration in enumerate((0.40, 0.46, 0.52), start=1):
-        swipe_to_next_room(driver, duration=duration)
+    for idx, (duration, start_ratio, distance_ratio) in enumerate(SWITCH_SWIPE_PROFILES, start=1):
+        fx, fy, tx, ty = swipe_to_next_room(
+            driver,
+            duration=duration,
+            start_y_ratio=start_ratio,
+            distance_ratio=distance_ratio,
+        )
+        log(
+            f"Swipe attempt {idx}: from=({fx},{fy}) to=({tx},{ty}), "
+            f"travel={max(0, fy - ty)}px, duration={duration:.2f}s."
+        )
         # Keep one swipe per attempt; double-swipe here can skip two rooms.
         time.sleep(0.20)
         base_post_wait = max(5.0, float(post_wait))
@@ -1341,7 +1425,7 @@ def close_overlays_and_reopen_luckybag(
     tap(driver, int(size["width"] * 0.5), int(size["height"] * 0.38))
     time.sleep(0.20)
 
-    open_hit = find_open_entry_hit(driver, ocr_engine)
+    open_hit = find_open_entry_hit(driver, ocr_engine, debug_context="post-fans-confirm")
     if open_hit is None:
         log("Post-fans-confirm reopen: no lucky-bag entry found.")
         return False
@@ -1361,65 +1445,54 @@ def try_open_popup_recheck_before_switch(
     ocr_engine: Optional[RapidOCR],
     reason: str,
 ) -> bool:
-    def _fallback_probe_points() -> list[tuple[int, int]]:
-        size = driver.get_window_size()
-        w, h = int(size["width"]), int(size["height"])
-        points: list[tuple[int, int]] = []
-
-        # Prefer last known open-entry location (even if cache TTL expired).
-        if _open_entry_cache_hit is not None:
-            x0, y0 = int(_open_entry_cache_hit.x), int(_open_entry_cache_hit.y)
-            points.extend(
-                [
-                    (x0, y0),
-                    (x0 + 22, y0),
-                    (x0 - 22, y0),
-                    (x0, y0 + 18),
-                ]
-            )
-
-        # Expanded deterministic probes across upper-left area.
-        ratio_points = [
-            (0.14, 0.14),
-            (0.20, 0.14),
-            (0.26, 0.14),
-            (0.32, 0.14),
-            (0.16, 0.20),
-            (0.22, 0.20),
-            (0.28, 0.20),
-            (0.34, 0.20),
-            (0.20, 0.26),
-            (0.28, 0.26),
-        ]
-        for rx, ry in ratio_points:
-            points.append((int(w * rx), int(h * ry)))
-
-        x_min = int(w * OPEN_ENTRY_REGION_X_MIN_RATIO)
-        y_min = int(h * OPEN_ENTRY_REGION_Y_MIN_RATIO)
-        x_max = int(w * min(0.40, OPEN_ENTRY_REGION_X_MAX_RATIO + 0.06))
-        y_max = int(h * min(0.44, OPEN_ENTRY_REGION_Y_MAX_RATIO + 0.06))
-
-        dedup: list[tuple[int, int]] = []
-        for x, y in points:
-            if x < x_min or y < y_min or x > x_max or y > y_max:
-                continue
-            if any(abs(x - px) <= 12 and abs(y - py) <= 12 for px, py in dedup):
-                continue
-            dedup.append((x, y))
-        return dedup
-
-    def _collect_popup_after_tap(x: int, y: int, tag: str) -> list[str]:
+    def _collect_popup_after_tap(x: int, y: int, tag: str, wait_s: float = 0.45) -> list[str]:
         if not is_safe_open_entry_point(driver, x, y):
             log(f"Pre-switch recheck skip unsafe OPEN tap ({tag}) @ ({x},{y})")
             return []
         log(f"Pre-switch recheck tap OPEN ({tag}) @ ({x},{y})")
         tap(driver, x, y)
-        time.sleep(0.55)
+        time.sleep(wait_s)
         return merged_scene_texts(driver, ocr_engine, prefer_ocr_for_popup=True, popup_lower_half=True)
 
-    log(f"Pre-switch recheck ({reason}): try opening lucky-bag popup once.")
-    open_hit = find_open_entry_hit(driver, ocr_engine)
+    def _quick_probe_points() -> list[tuple[int, int]]:
+        size = driver.get_window_size()
+        w = int(size["width"])
+        h = int(size["height"])
+        points: list[tuple[int, int]] = []
+
+        if _open_entry_cache_hit is not None:
+            points.append((int(_open_entry_cache_hit.x), int(_open_entry_cache_hit.y)))
+
+        if _open_entry_success_line_y is not None:
+            y = int(_open_entry_success_line_y)
+            for rx in (0.14, 0.20, 0.26, 0.32, 0.38):
+                points.append((int(w * rx), y))
+            for rx in (0.20, 0.32):
+                points.append((int(w * rx), y + 16))
+        else:
+            points.extend(
+                [
+                    (int(w * 0.14), int(h * 0.14)),
+                    (int(w * 0.20), int(h * 0.14)),
+                    (int(w * 0.26), int(h * 0.14)),
+                    (int(w * 0.32), int(h * 0.14)),
+                    (int(w * 0.20), int(h * 0.20)),
+                    (int(w * 0.28), int(h * 0.20)),
+                ]
+            )
+
+        dedup: list[tuple[int, int]] = []
+        for x, y in points:
+            if any(abs(x - px) <= 12 and abs(y - py) <= 12 for px, py in dedup):
+                continue
+            dedup.append((x, y))
+            if len(dedup) >= 6:
+                break
+        return dedup
+
+    log(f"Pre-switch recheck ({reason}): light detector + quick-probe check.")
     popup_texts: list[str] = []
+    open_hit = find_open_entry_hit(driver, ocr_engine, debug_context=f"recheck:{reason}")
     if open_hit is not None:
         popup_texts = _collect_popup_after_tap(
             open_hit.x,
@@ -1427,56 +1500,55 @@ def try_open_popup_recheck_before_switch(
             f"{open_hit.source}:{open_hit.text}",
         )
         if is_popularity_board_popup(popup_texts):
-            log("Pre-switch recheck: popularity-board popup detected after open-hit tap, dismiss and continue probes.")
+            log("Pre-switch recheck: popularity-board popup detected after detector tap, keep switch.")
             invalidate_open_entry_cache()
-            dismiss_overlays(driver, ocr_engine, rounds=3)
+            dismiss_overlays(driver, ocr_engine, rounds=2)
             popup_texts = []
-        if not is_luckybag_popup_visible(popup_texts):
-            log("Pre-switch recheck: popup not visible after open-hit tap.")
-            popup_texts = []
+        elif is_luckybag_popup_visible(popup_texts):
+            remember_open_entry_success_line(open_hit.y, source=f"precheck-open-hit:{open_hit.source}")
     else:
         log("Pre-switch recheck: no lucky-bag entry found from detector.")
 
-    # Fallback: when entry detection fails, probe a denser set of upper-left points.
     if not popup_texts:
-        fallback_points = _fallback_probe_points()
-        popularity_hits = 0
-        for idx, (fx, fy) in enumerate(fallback_points, start=1):
-            candidate_texts = _collect_popup_after_tap(fx, fy, f"fallback#{idx}")
-            if is_popularity_board_popup(candidate_texts):
-                log("Pre-switch recheck: popularity-board popup detected in fallback probe, dismiss and continue.")
+        probes = _quick_probe_points()
+        if probes:
+            log(f"Pre-switch recheck: quick probes={len(probes)}")
+        for idx, (qx, qy) in enumerate(probes, start=1):
+            candidate = _collect_popup_after_tap(qx, qy, f"quick#{idx}", wait_s=0.35)
+            if is_popularity_board_popup(candidate):
+                log("Pre-switch recheck: popularity-board popup detected in quick probe, keep switch.")
                 invalidate_open_entry_cache()
-                dismiss_overlays(driver, ocr_engine, rounds=3)
-                popularity_hits += 1
-                if popularity_hits >= OPEN_FALLBACK_MAX_POPULARITY_HITS:
-                    log("Pre-switch recheck: popularity-board hits exceeded threshold, stop fallback probes and keep switch.")
-                    return False
+                dismiss_overlays(driver, ocr_engine, rounds=2)
                 continue
-            if is_luckybag_popup_visible(candidate_texts):
-                popup_texts = candidate_texts
-                log(f"Pre-switch recheck: popup visible via fallback tap#{idx}.")
+            if is_luckybag_popup_visible(candidate):
+                popup_texts = candidate
+                remember_open_entry_success_line(qy, source=f"precheck-quick#{idx}")
+                log(f"Pre-switch recheck: popup visible via quick probe#{idx}.")
                 break
-        # One delayed retry pass to handle just-refreshed entrance animations.
-        if not popup_texts:
-            time.sleep(0.65)
-            open_hit_retry = find_open_entry_hit(driver, ocr_engine)
-            if open_hit_retry is not None:
-                candidate_texts = _collect_popup_after_tap(
-                    open_hit_retry.x,
-                    open_hit_retry.y,
-                    f"retry:{open_hit_retry.source}:{open_hit_retry.text}",
-                )
-                if is_popularity_board_popup(candidate_texts):
-                    log("Pre-switch recheck: popularity-board popup detected in delayed retry, dismiss and keep switch.")
-                    invalidate_open_entry_cache()
-                    dismiss_overlays(driver, ocr_engine, rounds=3)
-                    candidate_texts = []
-                if is_luckybag_popup_visible(candidate_texts):
-                    popup_texts = candidate_texts
-                    log("Pre-switch recheck: popup visible via delayed detector retry.")
-        if not popup_texts:
-            log("Pre-switch recheck: popup still not visible after fallback taps.")
-            return False
+
+    if not popup_texts:
+        time.sleep(0.45)
+        open_hit_retry = find_open_entry_hit(driver, ocr_engine, debug_context=f"recheck-retry:{reason}")
+        if open_hit_retry is not None:
+            candidate = _collect_popup_after_tap(
+                open_hit_retry.x,
+                open_hit_retry.y,
+                f"retry:{open_hit_retry.source}:{open_hit_retry.text}",
+                wait_s=0.45,
+            )
+            if is_popularity_board_popup(candidate):
+                log("Pre-switch recheck: popularity-board popup detected in delayed retry, keep switch.")
+                invalidate_open_entry_cache()
+                dismiss_overlays(driver, ocr_engine, rounds=2)
+                candidate = []
+            if is_luckybag_popup_visible(candidate):
+                popup_texts = candidate
+                remember_open_entry_success_line(open_hit_retry.y, source=f"precheck-retry:{open_hit_retry.source}")
+                log("Pre-switch recheck: popup visible via delayed detector retry.")
+
+    if not popup_texts:
+        log("Pre-switch recheck: popup not visible after light probes.")
+        return False
 
     if is_diamond_luckybag_popup(popup_texts):
         log("Pre-switch recheck: diamond popup detected, keep switch decision.")
@@ -1498,24 +1570,6 @@ def try_open_popup_recheck_before_switch(
         else:
             log(f"Pre-switch recheck: low-value long countdown popup (countdown={left}s, ref={ref_val}元), keep switch.")
         return False
-
-    # Run one mini main-flow task pass in recheck mode so we don't miss
-    # actionable tasks (e.g. 一键发表评论 / 加入粉丝团) before switching rooms.
-    joined = " | ".join(popup_texts)
-    should_try_tasks = has_unfinished_task_text(driver, ocr_engine) or any(
-        k in joined for k in ("一键发表评论", "加入粉丝团", "加入粉丝", "去参与", "立即参与", "参与抽奖")
-    )
-    if should_try_tasks:
-        taps, still_unfinished, fans_confirmed = run_task_panel_actions(driver, ocr_engine, rounds=4)
-        if taps > 0:
-            log(f"Pre-switch recheck task taps: {taps}")
-        if fans_confirmed:
-            log("Pre-switch recheck: fans-group confirm succeeded, reopen lucky-bag panel.")
-            close_overlays_and_reopen_luckybag(driver, ocr_engine)
-        popup_texts = merged_scene_texts(driver, ocr_engine, prefer_ocr_for_popup=True, popup_lower_half=True)
-        if still_unfinished:
-            log("Pre-switch recheck: task still unfinished after recheck taps; keep current room.")
-            return True
 
     if contains_success_in_texts(popup_texts) and has_luckybag_context(popup_texts):
         log("Pre-switch recheck detected success text in lucky-bag context; keep current room.")
@@ -1627,7 +1681,7 @@ def pick_task_text_buttons(
     strict_only: bool = False,
 ) -> list[Hit]:
     size = driver.get_window_size()
-    min_y = int(size["height"] * 0.55)
+    min_y = int(size["height"] * 0.50)
     max_y = int(size["height"] * 0.96)
     keys = STRICT_TASK_ACTION_TEXT_KEYWORDS if strict_only else TASK_ACTION_TEXT_KEYWORDS
 
@@ -1649,6 +1703,36 @@ def pick_task_text_buttons(
         if any(k in t for k in TASK_TEXT_BLOCKLIST):
             continue
         out.append(h)
+    return _dedup_hits(out, dist=14)
+
+
+def pick_comment_task_buttons(
+    driver: webdriver.Remote,
+    ocr_engine: Optional[RapidOCR],
+) -> list[Hit]:
+    size = driver.get_window_size()
+    min_y = int(size["height"] * 0.45)
+    max_y = int(size["height"] * 0.96)
+
+    hits = native_candidates(driver, COMMENT_TASK_KEYWORDS)
+    if not hits and ocr_engine is not None:
+        hits = ocr_candidates(driver, ocr_engine, COMMENT_TASK_KEYWORDS)
+
+    out: list[Hit] = []
+    for h in hits:
+        t = (h.text or "").strip()
+        if not t:
+            continue
+        if h.y < min_y or h.y > max_y:
+            continue
+        if any(k in t for k in TASK_ACTION_BLOCKLIST):
+            continue
+        if any(k in t for k in TASK_TEXT_BLOCKLIST):
+            continue
+        if not any(k in t for k in COMMENT_TASK_KEYWORDS):
+            continue
+        out.append(h)
+
     return _dedup_hits(out, dist=14)
 
 
@@ -1753,6 +1837,31 @@ def run_task_panel_actions(
     clicked_points: list[tuple[int, int]] = []
     still_unfinished = has_unfinished_task_text(driver, ocr_engine)
     fans_confirmed = False
+    zero_countdown_guard_handled = False
+
+    def _handle_zero_countdown_guard() -> bool:
+        nonlocal zero_countdown_guard_handled
+        if zero_countdown_guard_handled:
+            return True
+        popup_texts_guard = merged_scene_texts(driver, ocr_engine, prefer_ocr_for_popup=True, popup_lower_half=True)
+        if not is_popup_countdown_zero(popup_texts_guard):
+            return False
+
+        zero_countdown_guard_handled = True
+        log("Task tap guard: countdown is 0, stop tapping; close panel and recheck lucky-bag entry.")
+        dismiss_overlays(driver, ocr_engine, rounds=2)
+        size = driver.get_window_size()
+        tap(driver, int(size["width"] * 0.5), int(size["height"] * 0.38))
+        time.sleep(0.20)
+        open_hit_guard = find_open_entry_hit(driver, ocr_engine, debug_context="task-zero-guard")
+        if open_hit_guard is not None:
+            log(
+                f"Task tap guard: OPEN entry detected ({open_hit_guard.source}) "
+                f"-> '{open_hit_guard.text}' @ ({open_hit_guard.x},{open_hit_guard.y})"
+            )
+        else:
+            log("Task tap guard: OPEN entry not detected after closing panel.")
+        return True
 
     panel_texts = merged_scene_texts(driver, ocr_engine, prefer_ocr_for_popup=True, popup_lower_half=True)
     panel_confirmed = any(k in " | ".join(panel_texts) for k in PANEL_HINT_KEYWORDS)
@@ -1761,6 +1870,9 @@ def run_task_panel_actions(
         log("Lucky-bag panel hints not found; fallback to strict text-task taps only.")
 
     for round_idx in range(rounds):
+        if _handle_zero_countdown_guard():
+            still_unfinished = False
+            break
         if not still_unfinished and round_idx > 0:
             break
 
@@ -1803,12 +1915,31 @@ def run_task_panel_actions(
             tapped_this_round += 1
             time.sleep(0.35)
 
+        if tapped_this_round == 0 and still_unfinished:
+            for h in pick_comment_task_buttons(driver, ocr_engine):
+                if any(abs(h.x - px) <= 12 and abs(h.y - py) <= 12 for px, py in clicked_points):
+                    continue
+                log(f"Tap TASK (comment-retry:{h.source}) -> '{h.text}' @ ({h.x},{h.y})")
+                tap(driver, h.x, h.y)
+                clicked_points.append((h.x, h.y))
+                taps += 1
+                tapped_this_round += 1
+                time.sleep(0.35)
+                break
+
+        if _handle_zero_countdown_guard():
+            still_unfinished = False
+            break
+
         if tapped_this_round == 0:
             break
 
         time.sleep(0.35)
         still_unfinished = has_unfinished_task_text(driver, ocr_engine)
         if still_unfinished:
+            if _handle_zero_countdown_guard():
+                still_unfinished = False
+                break
             log("Task status still contains '未达成', continue tapping...")
 
     still_unfinished = has_unfinished_task_text(driver, ocr_engine)
@@ -1871,6 +2002,7 @@ def wait_countdown_and_check_result(
     last_reopen_ts = 0.0
     last_no_countdown_log_ts = 0.0
     no_bag_reopen_rounds = 0
+    last_countdown_task_try_ts = 0.0
 
     sample_step = max(0.5, float(sample_interval))
     next_sample_ts = time.time()
@@ -1899,6 +2031,13 @@ def wait_countdown_and_check_result(
         if left is None:
             left = parse_countdown_seconds(texts)
         if left is not None:
+            task_taps, last_countdown_task_try_ts = try_task_actions_during_active_countdown(
+                driver,
+                ocr_engine,
+                last_countdown_task_try_ts,
+            )
+            if task_taps > 0:
+                log(f"Draw-wait task taps: {task_taps}")
             countdown_found = True
             target = time.time() + left + timer_offset_seconds
             if left <= 1:
@@ -2367,6 +2506,8 @@ def main() -> int:
                 log(f"Open-entry countdown parsed: {open_entry_left}s")
 
             popup_texts = merged_scene_texts(driver, ocr_engine, prefer_ocr_for_popup=True, popup_lower_half=True)
+            if is_luckybag_popup_visible(popup_texts):
+                remember_open_entry_success_line(open_hit.y, source=f"main-open:{open_hit.source}")
 
             if is_popularity_board_popup(popup_texts):
                 log("Popularity-board popup detected after OPEN, dismiss overlays and continue scanning.")
