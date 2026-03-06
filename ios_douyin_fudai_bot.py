@@ -123,6 +123,11 @@ KW_SUCCESS         = ["已参与", "参与成功", "等待开奖", "参与成功
 
 KW_WIN  = ["恭喜抽中", "恭喜你抽中", "恭喜你中奖了", "抽中福袋"]
 KW_LOSE = ["未中奖", "未中签", "没有抽中福袋", "很遗憾", "下次再来", "擦肩而过"]
+# Prize-claim overlay (often appears above the half-screen popup area).
+# Example:
+#   恭喜抽中福袋 / 立即领取奖品 / 已阅读并同意 / 用户协议 / 隐私政策
+KW_WIN_CLAIM_CORE = ["恭喜抽中福袋", "立即领取奖品"]
+KW_WIN_CLAIM_AUX  = ["已阅读并同意", "用户协议", "隐私政策"]
 
 # Bags we skip
 KW_NONPHYSICAL    = ["红包", "金币", "福气值", "现金红包", "抖币", "音浪"]
@@ -885,6 +890,22 @@ def detect_result(texts: list[str]) -> Optional[str]:
     return None
 
 
+def detect_win_claim_popup(driver: webdriver.Remote) -> bool:
+    """
+    Detect the dedicated prize-claim overlay.
+    This overlay can appear in the upper/middle screen and may be missed by
+    lower-half-only text scans.
+    """
+    try:
+        texts = visible_texts(driver, lower_half=False)
+    except Exception:
+        return False
+    joined = _joined(texts)
+    if all(k in joined for k in KW_WIN_CLAIM_CORE):
+        return True
+    return ("恭喜抽中福袋" in joined) and _contains_any(joined, KW_WIN_CLAIM_AUX)
+
+
 def wait_for_result(
     driver: webdriver.Remote,
     ocr: object,
@@ -914,6 +935,11 @@ def wait_for_result(
             log(f"  [WARN] WAIT_DRAW read error: {e} — retrying in 2s")
             time.sleep(2.0)
             continue
+
+        # Prize-claim overlay can be outside lower-half region; check full screen.
+        if detect_win_claim_popup(driver):
+            log("Result: WIN (claim popup detected) ✓")
+            return "win"
 
         result = detect_result(texts)
         if result == "win":
@@ -1005,6 +1031,9 @@ def wait_for_result(
         time.sleep(poll)
 
     # Deadline hit
+    if detect_win_claim_popup(driver):
+        log("Result at deadline: win (claim popup)")
+        return "win"
     texts = visible_texts(driver, lower_half=True)
     r = detect_result(texts)
     if r:
@@ -1019,10 +1048,11 @@ def wait_for_result(
 # ---------------------------------------------------------------------------
 
 _SWIPE_PROFILES = (
-    (0.44, 0.58, 0.78),
-    (0.50, 0.62, 0.84),
-    (0.56, 0.66, 0.90),
-    (0.62, 0.66, 0.90),
+    # Short, decisive flicks to reduce long-press misclassification.
+    (0.22, 0.58, 0.78),
+    (0.28, 0.62, 0.84),
+    (0.34, 0.66, 0.90),
+    (0.40, 0.66, 0.90),
 )
 _IGNORE_IN_FP = ("福袋", "关闭", "关注", "分享", "更多", "评论", "说点什么",
                   "人气榜", "带货榜", "榜单", "直播中", "小时榜")
@@ -1290,6 +1320,19 @@ def run_bot(driver: webdriver.Remote, ocr: object, args: argparse.Namespace) -> 
 
         # ── PHASE: SCAN ──────────────────────────────────────────────────
         if state.phase == Phase.SCAN:
+            # Prize-claim overlay can appear outside lower-half popup region.
+            if detect_win_claim_popup(driver):
+                state.current_bag_round += 1
+                prize_str = f"¥{state.current_bag_ref:.0f}" if state.current_bag_ref else "未知奖品"
+                msg = (f"🎉 福袋开奖结果\n"
+                       f"第 {state.current_bag_round} 轮\n"
+                       f"结果：中奖！ 🏆\n"
+                       f"奖品参考价：{prize_str}\n"
+                       f"时间：{time.strftime('%H:%M:%S')}")
+                log("🎉 WIN claim popup detected in SCAN! Stopping bot.")
+                notify_imessage(args.notify_phone, msg)
+                return 0
+
             # Check for immediate success text (e.g. from previous join)
             texts = merged_texts(driver, ocr, lower_half=True)
             popup = analyze_popup(texts)
