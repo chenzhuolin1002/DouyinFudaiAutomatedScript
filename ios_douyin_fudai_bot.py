@@ -48,6 +48,27 @@ def log(msg: str) -> None:
     print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
 
 
+def notify_imessage(phone: Optional[str], msg: str) -> None:
+    """Send an iMessage via AppleScript. Silently skips if phone is None."""
+    if not phone:
+        return
+    safe_msg = msg.replace('"', '\\"').replace("'", "\\'")
+    safe_phone = phone.strip()
+    script = (
+        f'tell application "Messages"\n'
+        f'  set targetService to 1st service whose service type = iMessage\n'
+        f'  set targetBuddy to buddy "{safe_phone}" of targetService\n'
+        f'  send "{safe_msg}" to targetBuddy\n'
+        f'end tell'
+    )
+    try:
+        subprocess.run(["osascript", "-e", script], check=True, timeout=10,
+                       capture_output=True)
+        log(f"📱 iMessage sent to {safe_phone}")
+    except Exception as e:
+        log(f"[WARN] iMessage send failed: {e}")
+
+
 # ---------------------------------------------------------------------------
 # Screen layout constants (derived from screenshot analysis)
 #
@@ -58,26 +79,30 @@ def log(msg: str) -> None:
 # ---------------------------------------------------------------------------
 
 # Entry icon region (ratio of screen W/H)
-# Screenshot analysis (414x896 device):
-#   Icon = pink countdown thumbnail at ~(55, 235)pt, size ~48x48pt
-#   Sits just below the 带货总榜 row (~y=175pt)
-#   OLD box was far too wide/tall, risking false-positive matches on
-#   product bullets and sidebar cards in the 12-42% range.
-ENTRY_X_MIN = 0.04   # was 0.05 — icon left edge ~x=30pt
-ENTRY_X_MAX = 0.22   # was 0.45 — icon right edge ~x=80pt; 22-45% is empty
-ENTRY_Y_MIN = 0.22   # was 0.12 — 带货总榜 row ends ~y=195pt (21.7%)
-ENTRY_Y_MAX = 0.32   # was 0.42 — icon bottom ~y=260pt (29%); 32-42% is product list
+# Calibrated across two observed rooms:
+#   Room A (414pt, PROYA):     福袋 icon at x=55pt  (13% W), y=235pt (26% H)
+#   Room B (390pt, FlowerWest): 福袋 label at x=138pt (35% W), y=147pt (17% H)
+# The icon can appear anywhere in the top-left quadrant depending on overlays.
+# We use a wide-but-bounded box that excludes the right-side product panel
+# and the very top nav bar (status bar + streamer info row at y<10%).
+ENTRY_X_MIN = 0.03   # exclude far-left bezel
+ENTRY_X_MAX = 0.45   # right edge of left overlay cluster
+ENTRY_Y_MIN = 0.10   # below status bar / streamer name row
+ENTRY_Y_MAX = 0.42   # above mid-screen comment/chat area
 
 # Popup region (dark half-screen panel starts here)
 # Screenshot shows panel top edge at ~y=430pt = 47.9% of 896.
 # OLD value 0.52 (466pt) missed the 超级福袋 title and countdown row.
 POPUP_Y_MIN = 0.47   # was 0.52
 
-# Max element size for the small entry icon (~48x48pt on 414pt-wide screen)
-ENTRY_MAX_W_RATIO = 0.15   # was 0.22 — rejects wide product-card elements
-ENTRY_MAX_H_RATIO = 0.09   # was 0.16 — rejects tall sidebar items
-ENTRY_MAX_ASPECT   = 1.6   # was 1.8 — icon is nearly square
-ENTRY_MIN_SIDE_PX  = 12    # was 10
+# Max element size for the entry icon / label
+# Room A: square thumbnail ~48x48pt (11% W, 5% H)
+# Room B: text label ~60x30pt (15% W, 3.5% H)
+# Keep limits loose enough to catch both; shape filter rejects large product cards.
+ENTRY_MAX_W_RATIO = 0.22   # reject anything wider than 22% screen width
+ENTRY_MAX_H_RATIO = 0.12   # reject anything taller than 12% screen height
+ENTRY_MAX_ASPECT   = 4.0   # text labels can be wider than tall
+ENTRY_MIN_SIDE_PX  = 10    # must be at least 10pt on shorter side
 
 # ---------------------------------------------------------------------------
 # Keyword lists  (concise, no duplicates)
@@ -201,10 +226,19 @@ def screen_size(driver: webdriver.Remote, default: tuple[int,int] = (414, 896)) 
         return default
 
 
-def screenshot_np(driver: webdriver.Remote) -> np.ndarray:
+def screenshot_np(driver: webdriver.Remote, retries: int = 2) -> np.ndarray:
+    """Take screenshot with retry on WDA socket hang-up."""
     from io import BytesIO
-    png = driver.get_screenshot_as_png()
-    return np.array(Image.open(BytesIO(png)).convert("RGB"))
+    last_exc: Exception = RuntimeError("no attempts")
+    for attempt in range(1 + retries):
+        try:
+            png = driver.get_screenshot_as_png()
+            return np.array(Image.open(BytesIO(png)).convert("RGB"))
+        except Exception as e:
+            last_exc = e
+            if attempt < retries:
+                time.sleep(0.8)
+    raise last_exc
 
 
 # ---------------------------------------------------------------------------
@@ -303,7 +337,11 @@ def ocr_texts(
 ) -> list[str]:
     if ocr is None:
         return []
-    img = screenshot_np(driver)
+    try:
+        img = screenshot_np(driver)
+    except Exception as e:
+        log(f"[WARN] screenshot failed in ocr_texts ({e.__class__.__name__}), skipping OCR")
+        return []
     if lower_half:
         cut = int(img.shape[0] * POPUP_Y_MIN)
         img = img[cut:]
@@ -436,7 +474,11 @@ def find_entry_icon(
     cache.mark_ocr_used()
     if ocr is None:
         return None
-    img = screenshot_np(driver)
+    try:
+        img = screenshot_np(driver)
+    except Exception as e:
+        log(f"[WARN] screenshot failed in find_entry_icon OCR ({e.__class__.__name__}), skipping")
+        return None
     result, _ = ocr(img)  # type: ignore[operator]
     if not result:
         return None
@@ -708,7 +750,11 @@ def pick_hits(
 
     # OCR fallback
     if not out and ocr is not None:
-        img = screenshot_np(driver)
+        try:
+            img = screenshot_np(driver)
+        except Exception as e:
+            log(f"[WARN] screenshot failed in pick_hits ({e.__class__.__name__}), skipping OCR")
+            return out
         cut = int(img.shape[0] * y_min_r)
         crop = img[cut:]
         result, _ = ocr(crop)  # type: ignore[operator]
@@ -859,9 +905,15 @@ def wait_for_result(
     last_reopen   = 0.0
     last_task_try = 0.0
     last_left: Optional[int] = None
+    zero_since:   Optional[float] = None   # when we first saw left==0
 
     while time.time() < dyn_deadline:
-        texts = merged_texts(driver, ocr, lower_half=True)
+        try:
+            texts = merged_texts(driver, ocr, lower_half=True)
+        except Exception as e:
+            log(f"  [WARN] WAIT_DRAW read error: {e} — retrying in 2s")
+            time.sleep(2.0)
+            continue
 
         result = detect_result(texts)
         if result == "win":
@@ -895,24 +947,59 @@ def wait_for_result(
 
             # Immediately probe when countdown reaches 0
             if left <= 1:
-                log("  Countdown reached 0, probing result…")
-                probe_end = time.time() + max(3.0, grace + 5.0)
+                if zero_since is None:
+                    zero_since = time.time()
+                # Probe for win/lose for up to grace+6s
+                probe_end = zero_since + max(8.0, grace + 6.0)
                 while time.time() < probe_end:
-                    probe_texts = visible_texts(driver, lower_half=True)
-                    r = detect_result(probe_texts)
-                    if r:
-                        log(f"Result after countdown: {r}")
-                        return r
+                    try:
+                        probe_texts = visible_texts(driver, lower_half=True)
+                        r = detect_result(probe_texts)
+                        if r:
+                            log(f"Result after countdown: {r}")
+                            return r
+                    except Exception:
+                        pass
                     time.sleep(poll)
-                return "unknown_after_countdown"
+                # Timed out waiting for result — popup is stale, close and re-scan
+                log("  No result detected at 00:00 — dismissing popup, re-scanning room.")
+                return "expired_no_result"
+            else:
+                zero_since = None  # reset if countdown is running again
         else:
+            # No countdown visible at all — popup may have collapsed or 00:00 is
+            # a stale frozen display that _parse_countdown can't match (no 后开奖 anchor).
+            now = time.time()
+
+            # Direct text scan for frozen 00:00 popup
+            raw_texts = visible_texts(driver, lower_half=True)
+            raw_joined = " ".join(raw_texts)
+            popup_visible = "超级福袋" in raw_joined or "后开奖" in raw_joined or "等待开奖" in raw_joined
+            frozen_zero   = "00" in raw_joined and ("后开奖" in raw_joined or "超级福袋" in raw_joined)
+
+            if popup_visible and frozen_zero:
+                if zero_since is None:
+                    zero_since = now
+                    log("  Detected 00:00 frozen popup — waiting briefly for result…")
+                elif now - zero_since > grace + 6.0:
+                    log("  Popup frozen at 00:00 with no result — closing and re-scanning.")
+                    return "expired_no_result"
+            else:
+                zero_since = None
+
+            # Heartbeat every 20s
+            if not hasattr(wait_for_result, '_hb') or now - getattr(wait_for_result, '_hb', 0) >= 20:
+                remaining = max(0, int(dyn_deadline - now))
+                log(f"  Polling for result… ({remaining}s left)")
+                wait_for_result._hb = now  # type: ignore[attr-defined]
+
             # Popup may have collapsed — try to reopen
-            if time.time() - last_reopen > reopen_interval and entry_cache:
+            if now - last_reopen > reopen_interval and entry_cache:
                 open_hit = entry_cache.get()
-                if open_hit:
+                if open_hit and not popup_visible:
                     log(f"  Reopen popup → ({open_hit.x},{open_hit.y})")
                     tap(driver, open_hit.x, open_hit.y)
-                    last_reopen = time.time()
+                    last_reopen = now
                     time.sleep(0.7)
 
         time.sleep(poll)
@@ -973,30 +1060,65 @@ def room_changed(before: frozenset[str], after: frozenset[str]) -> bool:
 
 def dismiss_overlays(driver: webdriver.Remote, ocr: object, rounds: int = 3) -> int:
     closed = 0
-    _, h = screen_size(driver)
+    w, h_ = screen_size(driver)
     for _ in range(rounds):
-        # Try named close buttons first
-        hits = scrape_elements(driver, keywords=KW_CLOSE)
-        safe = [
-            h_ for h_ in hits
-            if not _contains_any(h_.text, KW_RISKY_CLOSE)
-            and not (h_.x < screen_size(driver)[0] * 0.46 and h_.y < screen_size(driver)[1] * 0.20)
-        ]
-        if safe:
-            h_ = min(safe, key=lambda x: len(x.text))
-            log(f"  Dismiss overlay '{h_.text}' @ ({h_.x},{h_.y})")
-            tap(driver, h_.x, h_.y)
+        # 1. Try the × close button in top-right of the 福袋 popup
+        #    On screenshot it sits at ~(683,136) on a 390×844pt screen ≈ (93%W, 16%H)
+        close_hits = scrape_elements(
+            driver,
+            types={"XCUIElementTypeButton", "XCUIElementTypeStaticText", "XCUIElementTypeOther"},
+            x_min_r=0.80, x_max_r=1.0,
+            y_min_r=0.10, y_max_r=0.25,
+        )
+        # Filter to small elements likely to be × close icons
+        x_hits = [h for h in close_hits if h.w <= 60 and h.h <= 60]
+        if x_hits:
+            best = min(x_hits, key=lambda h: h.w * h.h)  # smallest = most likely icon
+            log(f"  Tap × close button '{best.text}' @ ({best.x},{best.y})")
+            tap(driver, best.x, best.y)
             closed += 1
-            time.sleep(0.25)
+            time.sleep(0.4)
+            post = visible_texts(driver, lower_half=True)
+            if not _contains_any(_joined(post), KW_POPUP_ANCHOR):
+                break
             continue
 
-        # Tap neutral area to collapse popup
+        # 2. Try named close buttons
+        hits = scrape_elements(driver, keywords=KW_CLOSE)
+        safe = [
+            hh for hh in hits
+            if not _contains_any(hh.text, KW_RISKY_CLOSE)
+            and not (hh.x < w * 0.46 and hh.y < h_ * 0.20)
+        ]
+        if safe:
+            hh = min(safe, key=lambda x: len(x.text))
+            log(f"  Dismiss overlay '{hh.text}' @ ({hh.x},{hh.y})")
+            tap(driver, hh.x, hh.y)
+            closed += 1
+            time.sleep(0.3)
+            continue
+
+        # Check if the 福袋 popup is open; if so tap above it to dismiss
         popup_texts = merged_texts(driver, ocr, lower_half=True)
         if _contains_any(_joined(popup_texts), KW_POPUP_ANCHOR + KW_POPULARITY):
-            w, h_ = screen_size(driver)
-            tap(driver, int(w * 0.5), int(h_ * 0.38))
+            sw, sh = screen_size(driver)
+            # Tap the live-stream area above the popup to collapse it
+            log("  Tap above popup to dismiss.")
+            tap(driver, int(sw * 0.5), int(sh * 0.35))
             closed += 1
-            time.sleep(0.22)
+            time.sleep(0.35)
+            # Verify popup gone
+            post = visible_texts(driver, lower_half=True)
+            if not _contains_any(_joined(post), KW_POPUP_ANCHOR):
+                break  # dismissed successfully
+            # Still open — try a swipe-down gesture on the popup
+            log("  Popup still open, trying swipe-down to close.")
+            driver.execute_script("mobile: dragFromToWithVelocity", {
+                "fromX": sw * 0.5, "fromY": sh * 0.65,
+                "toX":   sw * 0.5, "toY":   sh * 0.90,
+                "velocity": 800,
+            })
+            time.sleep(0.4)
             continue
         break
     return closed
@@ -1065,6 +1187,10 @@ class Phase(Enum):
 class BotState:
     phase:               Phase = Phase.SCAN
     entry_cache:         EntryCache = field(default_factory=EntryCache)
+
+    # current bag being tracked
+    current_bag_ref:     Optional[float] = None   # ¥ ref value of current bag
+    current_bag_round:   int = 0                  # round counter across all bags
 
     # counters
     open_retries:        int = 0
@@ -1137,6 +1263,21 @@ def run_bot(driver: webdriver.Remote, ocr: object, args: argparse.Namespace) -> 
             texts = merged_texts(driver, ocr, lower_half=True)
             popup = analyze_popup(texts)
             if popup.has_success and popup.kind == PopupKind.FUDAI:
+                # Guard: don't enter WAIT_DRAW if countdown is already at 0 or
+                # undetectable (frozen 00:00 display) — draw is over, close popup.
+                joined_lower = _joined(texts)
+                frozen_zero = (
+                    (popup.countdown_sec is not None and popup.countdown_sec <= 2) or
+                    (popup.countdown_sec is None and
+                     ("超级福袋" in joined_lower or "等待开奖" in joined_lower) and
+                     "00" in joined_lower)
+                )
+                if frozen_zero:
+                    log("Success popup at 00:00 — closing stale popup and re-scanning.")
+                    dismiss_overlays(driver, ocr, rounds=4)
+                    state.reset_for_new_room()
+                    state.phase = Phase.SCAN
+                    continue
                 log("Success text detected in SCAN — going straight to WAIT_DRAW.")
                 state.phase = Phase.WAIT_DRAW
                 continue
@@ -1249,6 +1390,8 @@ def run_bot(driver: webdriver.Remote, ocr: object, args: argparse.Namespace) -> 
 
             # PopupKind.FUDAI ✅
             state.open_retries = 0  # valid popup resets retry counter
+            # Save bag info for result notification
+            state.current_bag_ref = popup.ref_value
 
             if popup.has_success:
                 log("  Already joined — going to WAIT_DRAW.")
@@ -1307,11 +1450,40 @@ def run_bot(driver: webdriver.Remote, ocr: object, args: argparse.Namespace) -> 
                 entry_cache=state.entry_cache,
             )
             if draw_result == "win":
+                state.current_bag_round += 1
+                prize_str = f"¥{state.current_bag_ref:.0f}" if state.current_bag_ref else "未知奖品"
+                msg = (f"🎉 福袋开奖结果\n"
+                       f"第 {state.current_bag_round} 轮\n"
+                       f"结果：中奖！ 🏆\n"
+                       f"奖品参考价：{prize_str}\n"
+                       f"时间：{time.strftime('%H:%M:%S')}")
                 log("🎉 WIN! Stopping bot.")
+                notify_imessage(args.notify_phone, msg)
                 return 0
             elif draw_result in ("lose", "unknown_after_countdown"):
+                state.current_bag_round += 1
+                prize_str = f"¥{state.current_bag_ref:.0f}" if state.current_bag_ref else "未知奖品"
+                msg = (f"😔 福袋开奖结果\n"
+                       f"第 {state.current_bag_round} 轮\n"
+                       f"结果：未中奖\n"
+                       f"奖品参考价：{prize_str}\n"
+                       f"时间：{time.strftime('%H:%M:%S')}")
+                notify_imessage(args.notify_phone, msg)
                 log(f"Draw outcome: {draw_result} — switching room.")
                 state.phase = Phase.SWITCH
+            elif draw_result == "expired_no_result":
+                state.current_bag_round += 1
+                prize_str = f"¥{state.current_bag_ref:.0f}" if state.current_bag_ref else "未知奖品"
+                msg = (f"⏱ 福袋开奖结果\n"
+                       f"第 {state.current_bag_round} 轮\n"
+                       f"结果：未检测到 (00:00 超时)\n"
+                       f"奖品参考价：{prize_str}\n"
+                       f"时间：{time.strftime('%H:%M:%S')}")
+                notify_imessage(args.notify_phone, msg)
+                log("Draw outcome: 00:00 reached, no result — closing popup, re-scanning room.")
+                dismiss_overlays(driver, ocr, rounds=4)
+                state.reset_for_new_room()
+                state.phase = Phase.SCAN
             else:
                 log(f"Draw outcome: {draw_result} — staying in room, re-scanning.")
                 state.reset_for_new_room()
@@ -1365,6 +1537,8 @@ def main() -> int:
     parser.add_argument("--draw-result-max-wait",     type=int,   default=240)
     parser.add_argument("--room-stall-seconds",       type=float, default=45.0)
     parser.add_argument("--max-unfinished-rounds",    type=int,   default=3)
+    parser.add_argument("--notify-phone",             type=str,   default=None,
+                        help="Phone number to iMessage draw results to (e.g. +8613812345678)")
 
     args = parser.parse_args()
 
