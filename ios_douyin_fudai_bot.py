@@ -108,7 +108,7 @@ ENTRY_MIN_SIDE_PX  = 10    # must be at least 10pt on shorter side
 # Keyword lists  (concise, no duplicates)
 # ---------------------------------------------------------------------------
 
-KW_OPEN_ENTRY     = ["福袋"]
+KW_OPEN_ENTRY     = ["福袋", "超级福袋", "幸运福袋", "福袋抽奖"]
 KW_JOIN           = ["去参与", "立即参与", "参与抽奖", "马上参与"]
 
 # Tasks inside the popup
@@ -1027,6 +1027,37 @@ _SWIPE_PROFILES = (
 _IGNORE_IN_FP = ("福袋", "关闭", "关注", "分享", "更多", "评论", "说点什么",
                   "人气榜", "带货榜", "榜单", "直播中", "小时榜")
 
+# Home-screen tab bar tokens — if we see these we're NOT in a live room
+_HOME_TAB_TOKENS = ("综合", "用户", "视频", "朋友", "消息", "我")
+
+def is_in_live_room(driver: webdriver.Remote) -> bool:
+    """Return False if the bot has drifted to the Douyin home/search screen."""
+    try:
+        hits = scrape_elements(
+            driver,
+            types={"XCUIElementTypeButton", "XCUIElementTypeStaticText"},
+            x_min_r=ENTRY_X_MIN, x_max_r=ENTRY_X_MAX,
+            y_min_r=0.08, y_max_r=0.20,
+        )
+        texts = " ".join(h.text for h in hits)
+        if _contains_any(texts, list(_HOME_TAB_TOKENS)):
+            return False
+    except Exception:
+        pass
+    return True
+
+def relaunch_into_live(driver: webdriver.Remote) -> None:
+    """If not in a live room, press Home and reopen Douyin to resume a live feed."""
+    log("[WARN] Not in a live room — relaunching Douyin.")
+    try:
+        driver.execute_script("mobile: pressButton", {"name": "home"})
+        time.sleep(1.5)
+        driver.execute_script("mobile: launchApp", {"bundleId": "com.ss.iphone.ugc.Aweme"})
+        time.sleep(4.0)
+        log("  Douyin relaunched. Please navigate into a live room.")
+    except Exception as e:
+        log(f"  Relaunch failed: {e}")
+
 
 def room_fingerprint(driver: webdriver.Remote) -> frozenset[str]:
     _, h = screen_size(driver)
@@ -1320,12 +1351,26 @@ def run_bot(driver: webdriver.Remote, ocr: object, args: argparse.Namespace) -> 
                 state.phase = Phase.SCAN  # re-scan for success
                 continue
 
+            # Guard: if we've drifted to the Douyin home screen, relaunch
+            if not is_in_live_room(driver):
+                relaunch_into_live(driver)
+                state.reset_for_new_room()
+                time.sleep(5.0)
+                continue
+
             # Look for entry icon
             entry = find_entry_icon(driver, ocr, state.entry_cache)
             if entry is None:
                 state.no_open_rounds += 1
-                log(f"No 福袋 entry icon found (#{state.no_open_rounds}).")
-                if state.no_open_rounds >= 2:
+                # Debug: dump all elements visible in the entry region
+                region_els = scrape_elements(
+                    driver,
+                    types={"XCUIElementTypeButton", "XCUIElementTypeStaticText", "XCUIElementTypeImage"},
+                    x_min_r=ENTRY_X_MIN, x_max_r=ENTRY_X_MAX,
+                    y_min_r=ENTRY_Y_MIN, y_max_r=ENTRY_Y_MAX,
+                )
+                log(f"No 福袋 entry icon found (#{state.no_open_rounds}). Region elements: {[(e.text, e.x, e.y) for e in region_els]}")
+                if state.no_open_rounds >= 4:
                     log("Entry icon absent — switching room.")
                     state.phase = Phase.SWITCH
                 else:
