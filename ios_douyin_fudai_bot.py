@@ -115,7 +115,7 @@ KW_JOIN           = ["去参与", "立即参与", "参与抽奖", "马上参与"
 KW_FANS_JOIN      = ["加入粉丝团", "去加入粉丝团", "立即加入粉丝团", "加入粉丝"]
 KW_FANS_CONFIRM   = ["确认加入", "确认", "加入并关注", "立即加入"]
 KW_COMMENT_TASK   = ["一键发表评论", "一键评论", "发表评论", "去评论"]
-KW_TASK_GENERIC   = ["去完成", "去参与", "立即参与", "参与抽奖", "一键参与"]
+KW_TASK_GENERIC   = ["去完成", "去参与", "立即参与", "参与抽奖", "一键参与", "观看直播"]
 
 KW_TASK_UNFINISHED = ["未达成", "未完成", "未满足"]
 KW_TASK_DONE       = ["已达成", "已完成"]   # right-side status on each completed task row
