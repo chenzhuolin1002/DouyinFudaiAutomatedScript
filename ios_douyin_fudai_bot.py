@@ -19,10 +19,14 @@ Key improvements over previous version:
 from __future__ import annotations
 
 import argparse
+import json
+import os
 import random
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
@@ -112,8 +116,25 @@ KW_OPEN_ENTRY     = ["福袋", "超级福袋", "幸运福袋", "福袋抽奖"]
 KW_JOIN           = ["去参与", "立即参与", "参与抽奖", "马上参与"]
 
 # Tasks inside the popup
-KW_FANS_JOIN      = ["加入粉丝团", "去加入粉丝团", "立即加入粉丝团", "加入粉丝"]
-KW_FANS_CONFIRM   = ["确认加入", "确认", "加入并关注", "立即加入"]
+KW_FANS_JOIN      = [
+    "加入粉丝团",
+    "去加入粉丝团",
+    "立即加入粉丝团",
+    "加入购物粉丝团",
+    "去加入购物粉丝团",
+    "立即加入购物粉丝团",
+    "加入粉丝",
+]
+KW_FANS_CONFIRM   = [
+    "确认加入",
+    "确认加入粉丝团",
+    "确认",
+    "加入并关注",
+    "立即加入",
+    "同意并加入",
+    "支付并加入",
+    "开通粉丝团",
+]
 KW_COMMENT_TASK   = ["一键发表评论", "一键评论", "发表评论", "去评论"]
 KW_TASK_GENERIC   = ["去完成", "去参与", "立即参与", "参与抽奖", "一键参与", "观看直播"]
 
@@ -184,7 +205,105 @@ def _joined(texts: list[str]) -> str:
 # Appium driver
 # ---------------------------------------------------------------------------
 
+EXCLUDED_DEVICE_MODEL_NAMES = {"iphone 13 pro max"}
+EXCLUDED_DEVICE_PRODUCT_TYPES = {"iphone14,3"}
+
+
+def _normalize_model_text(text: object) -> str:
+    return re.sub(r"\s+", " ", str(text or "")).strip().lower()
+
+
+def _is_excluded_device_model(*name_like_fields: str, product_type: str = "") -> bool:
+    normalized_product = _normalize_model_text(product_type)
+    if normalized_product in EXCLUDED_DEVICE_PRODUCT_TYPES:
+        return True
+    for raw in name_like_fields:
+        normalized = _normalize_model_text(raw)
+        if not normalized:
+            continue
+        for model_name in EXCLUDED_DEVICE_MODEL_NAMES:
+            if model_name in normalized:
+                return True
+    return False
+
+
+def _discover_connected_udids_from_devicectl(only_wired: bool = True) -> list[str]:
+    if shutil.which("xcrun") is None:
+        return []
+    tmp_path = ""
+    try:
+        with tempfile.NamedTemporaryFile(prefix="ios-devices-", suffix=".json", delete=False) as tf:
+            tmp_path = tf.name
+        subprocess.check_output(
+            ["xcrun", "devicectl", "list", "devices", "--json-output", tmp_path],
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=20,
+        )
+        with open(tmp_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        return []
+    finally:
+        if tmp_path:
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
+
+    result = data.get("result", {}) if isinstance(data, dict) else {}
+    devices = result.get("devices", []) if isinstance(result, dict) else []
+    wired: list[str] = []
+    non_wired: list[str] = []
+    for item in devices:
+        if not isinstance(item, dict):
+            continue
+        hw = item.get("hardwareProperties") or {}
+        conn = item.get("connectionProperties") or {}
+        dev = item.get("deviceProperties") or {}
+        if not isinstance(hw, dict) or not isinstance(conn, dict) or not isinstance(dev, dict):
+            continue
+
+        udid = str(hw.get("udid") or "").strip()
+        if not udid:
+            continue
+        if str(hw.get("reality") or "").lower() not in ("", "physical"):
+            continue
+
+        platform = str(hw.get("platform") or "").strip().lower()
+        if platform != "ios":
+            continue
+        device_type = str(hw.get("deviceType") or "").strip().lower()
+        if device_type not in ("iphone", "ipad"):
+            continue
+
+        pairing_state = str(conn.get("pairingState") or "").strip().lower()
+        if pairing_state and pairing_state != "paired":
+            continue
+
+        product_type = str(hw.get("productType") or hw.get("thinningProductType") or "").strip()
+        marketing_name = str(hw.get("marketingName") or "").strip()
+        device_name = str(dev.get("name") or "").strip()
+        if _is_excluded_device_model(device_name, marketing_name, product_type=product_type):
+            continue
+
+        transport_type = str(conn.get("transportType") or "").strip().lower()
+        if only_wired and transport_type and transport_type != "wired":
+            continue
+        if transport_type == "wired":
+            wired.append(udid)
+        else:
+            non_wired.append(udid)
+
+    ordered = wired if only_wired else (wired + non_wired)
+    return list(dict.fromkeys(ordered))
+
+
 def auto_detect_udid() -> Optional[str]:
+    for only_wired in (True, False):
+        udids = _discover_connected_udids_from_devicectl(only_wired=only_wired)
+        if udids:
+            return udids[0]
     try:
         out = subprocess.check_output(
             ["xcrun", "xctrace", "list", "devices"],
@@ -196,6 +315,8 @@ def auto_detect_udid() -> Optional[str]:
     for line in out.splitlines():
         s = line.strip()
         if not s or any(x in s for x in ("Simulator", "Mac", "Watch")):
+            continue
+        if _is_excluded_device_model(s):
             continue
         m = p.search(s)
         if m:
@@ -806,46 +927,119 @@ def execute_tasks(
             log("Task: countdown hit 0 during tasks.")
             return TaskResult.EXPIRED
 
-        if not popup.has_unfinished_tasks and round_idx > 0:
+        if popup.kind == PopupKind.FUDAI and (not popup.has_unfinished_tasks) and round_idx > 0:
             log("Task: no more unfinished tasks.")
             return TaskResult.TASKS_DONE
 
         tapped_this_round: list[tuple[int, int]] = []
 
-        def _tap_hit(h: Hit, label: str) -> None:
-            if any(abs(h.x - px) < 12 and abs(h.y - py) < 12 for px, py in tapped_this_round):
+        sw, sh = screen_size(driver)
+
+        def _tap_hit(h: Hit, label: str, allow_duplicate: bool = False) -> None:
+            if (not allow_duplicate) and any(abs(h.x - px) < 12 and abs(h.y - py) < 12 for px, py in tapped_this_round):
                 return
             log(f"  Tap {label} → '{h.text}' @ ({h.x},{h.y})")
             tap(driver, h.x, h.y)
             tapped_this_round.append((h.x, h.y))
             time.sleep(0.35)
 
+        def _tap_row_action(h: Hit, label: str) -> None:
+            # Task action buttons are usually on the right side of the same row.
+            if h.y < int(sh * 0.35):
+                return
+            action_x = min(sw - 24, max(24, int(sw * 0.86)))
+            if any(abs(action_x - px) < 12 and abs(h.y - py) < 12 for px, py in tapped_this_round):
+                return
+            log(f"  Tap {label}-action → row@({h.x},{h.y}) action@({action_x},{h.y})")
+            tap(driver, action_x, h.y)
+            tapped_this_round.append((action_x, h.y))
+            time.sleep(0.35)
+
+        def _close_fans_overlay_and_reopen_entry() -> bool:
+            log("  Fans flow done — closing fans overlay and returning via 福袋入口.")
+            dismiss_overlays(driver, ocr, rounds=3)
+            time.sleep(0.45)
+            local_cache = EntryCache(ttl=2.0, ocr_cooldown=0.8)
+            deadline = time.time() + 8.0
+            while time.time() < deadline:
+                entry = find_entry_icon(driver, ocr, local_cache)
+                if entry is None:
+                    local_cache.invalidate()
+                    time.sleep(0.35)
+                    continue
+                log(f"  Re-open 福袋 ({entry.src}) → '{entry.text}' @ ({entry.x},{entry.y})")
+                tap(driver, entry.x, entry.y)
+                time.sleep(0.75)
+                post_texts = merged_texts(driver, ocr, lower_half=True)
+                post_popup = analyze_popup(post_texts)
+                if post_popup.kind != PopupKind.NONE:
+                    return True
+                local_cache.invalidate()
+                time.sleep(0.35)
+            log("  [WARN] Failed to restore 福袋 popup after fans flow.")
+            return False
+
         # 1. Comment task — search wider y range and log if missing
         comment_hits = pick_hits(driver, ocr, KW_COMMENT_TASK, y_min_r=0.35, max_text_len=12)
         if comment_hits:
             for h in comment_hits:
-                _tap_hit(h, "comment-task")
+                _tap_hit(h, "comment-task-label")
+                _tap_row_action(h, "comment-task")
             time.sleep(0.6)  # wait for comment to register
         else:
             log("  [WARN] Comment button not found — dumping popup texts for debug")
             for t in texts:
                 log(f"    popup text: {t!r}")
 
-        # 2. Fans-group join
-        fans_hits = pick_hits(driver, ocr, KW_FANS_JOIN)
-        for h in fans_hits:
-            _tap_hit(h, "fans-join")
+        # 2. Fans-group join (explicit 3-step flow)
+        # Step 1: click fans button on 福袋 popup task row
+        # Step 2: wait for secondary fans panel and click its fans button again
+        # Step 3: optional confirm popup -> click confirm
+        fans_hits = pick_hits(driver, ocr, KW_FANS_JOIN, y_min_r=0.35, max_text_len=24)
+        if fans_hits:
+            # Execute one deterministic fans flow per round to avoid duplicate step loops.
+            h = sorted(fans_hits, key=lambda z: (z.y, z.x))[0]
+            # Step 1
+            _tap_hit(h, "fans-step1")
+            _tap_row_action(h, "fans-step1")
             time.sleep(0.4)
-            # Handle confirmation popup
-            confirm_hits = pick_hits(driver, ocr, KW_FANS_CONFIRM, y_min_r=0.35)
-            for c in confirm_hits:
-                # Safety: skip if text is on fans-group ignore list
-                if _contains_any(c.text, ["粉丝团规则", "购物粉丝团权益", "待解锁", "酷炫勋章"]):
-                    continue
-                log(f"  Tap fans-confirm → '{c.text}' @ ({c.x},{c.y})")
-                tap(driver, c.x, c.y)
-                time.sleep(0.45)
-                break  # one confirm tap is enough
+
+            # Step 2
+            step2_done = False
+            step2_deadline = time.time() + 6.0
+            while time.time() < step2_deadline:
+                step2_hits = pick_hits(driver, ocr, KW_FANS_JOIN, y_min_r=0.20, max_text_len=24)
+                step2_hits = [
+                    x for x in step2_hits
+                    if not _contains_any(x.text, ["粉丝团规则", "粉丝团权益", "购物粉丝团权益", "待解锁", "酷炫勋章"])
+                ]
+                if step2_hits:
+                    c = sorted(step2_hits, key=lambda z: (z.y, z.x), reverse=True)[0]
+                    _tap_hit(c, "fans-step2", allow_duplicate=True)
+                    step2_done = True
+                    break
+                time.sleep(0.35)
+            if not step2_done:
+                log("  [WARN] fans-step2 not detected in secondary panel.")
+
+            # Step 3 (optional)
+            confirm_done = False
+            confirm_deadline = time.time() + 4.0
+            while time.time() < confirm_deadline:
+                confirm_hits = pick_hits(driver, ocr, KW_FANS_CONFIRM, y_min_r=0.20, max_text_len=28)
+                for c in sorted(confirm_hits, key=lambda z: (z.y, z.x), reverse=True):
+                    if _contains_any(c.text, ["粉丝团规则", "粉丝团权益", "购物粉丝团权益", "待解锁", "酷炫勋章", "规则", "权益"]):
+                        continue
+                    _tap_hit(c, "fans-step3-confirm", allow_duplicate=True)
+                    confirm_done = True
+                    break
+                if confirm_done:
+                    break
+                time.sleep(0.3)
+            if not confirm_done:
+                log("  fans-step3-confirm not shown (optional), continue.")
+
+            _close_fans_overlay_and_reopen_entry()
 
         # 3. Generic task buttons
         for h in pick_hits(driver, ocr, KW_TASK_GENERIC):
@@ -862,7 +1056,7 @@ def execute_tasks(
     popup = analyze_popup(texts)
     if popup.has_success:
         return TaskResult.SUCCESS
-    if not popup.has_unfinished_tasks:
+    if popup.kind == PopupKind.FUDAI and not popup.has_unfinished_tasks:
         return TaskResult.TASKS_DONE
     return TaskResult.STILL_OPEN
 
@@ -1368,12 +1562,6 @@ def run_bot(driver: webdriver.Remote, ocr: object, args: argparse.Namespace) -> 
                 state.phase = Phase.SWITCH
                 continue
 
-            # Stall guard
-            if state.stalled(args.room_stall_seconds):
-                log(f"Room stalled for {args.room_stall_seconds}s — switching room.")
-                state.phase = Phase.SWITCH
-                continue
-
             # If popup is open (no icon found but popup visible), dismiss first
             popup_peek = analyze_popup(texts)
             if popup_peek.kind != PopupKind.NONE:
@@ -1381,6 +1569,7 @@ def run_bot(driver: webdriver.Remote, ocr: object, args: argparse.Namespace) -> 
                 dismiss_overlays(driver, ocr, rounds=3)
                 time.sleep(0.4)
                 state.entry_cache.invalidate()
+                state.mark_progress()
                 continue
 
             # Look for direct JOIN button
@@ -1413,7 +1602,13 @@ def run_bot(driver: webdriver.Remote, ocr: object, args: argparse.Namespace) -> 
                     y_min_r=ENTRY_Y_MIN, y_max_r=ENTRY_Y_MAX,
                 )
                 log(f"No 福袋 entry icon found (#{state.no_open_rounds}). Region elements: {[(e.text, e.x, e.y) for e in region_els]}")
-                if state.no_open_rounds >= 4:
+                if state.stalled(args.room_stall_seconds) and state.no_open_rounds >= 2:
+                    log(
+                        f"Room stalled for {args.room_stall_seconds}s with no entry icon "
+                        f"for {state.no_open_rounds} scans — switching room."
+                    )
+                    state.phase = Phase.SWITCH
+                elif state.no_open_rounds >= 4:
                     log("Entry icon absent — switching room.")
                     state.phase = Phase.SWITCH
                 else:
@@ -1421,6 +1616,7 @@ def run_bot(driver: webdriver.Remote, ocr: object, args: argparse.Namespace) -> 
                 continue
 
             state.no_open_rounds = 0
+            state.mark_progress()
             state.phase = Phase.OPEN
             continue
 
@@ -1633,7 +1829,10 @@ def main() -> int:
     if args.udid == "auto":
         detected = auto_detect_udid()
         if not detected:
-            raise RuntimeError("Cannot auto-detect UDID. Pass --udid explicitly.")
+            raise RuntimeError(
+                "Cannot auto-detect eligible UDID (iPhone 13 Pro Max is excluded). "
+                "Connect another supported device or pass --udid explicitly."
+            )
         args.udid = detected
         log(f"Auto-detected UDID: {args.udid}")
 

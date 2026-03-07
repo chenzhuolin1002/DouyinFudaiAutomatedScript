@@ -35,6 +35,8 @@ DEFAULT_STATE_DIR = ROOT / ".runtime" / "multi-device-manager"
 DEFAULT_BUNDLE_ID = "com.ss.iphone.ugc.Aweme"
 DEFAULT_XCODE_ORG_ID = "997XR67PRS"
 DEFAULT_UPDATED_WDA_BUNDLE_ID = "com.see2see.livecontainer"
+EXCLUDED_DEVICE_MODEL_NAMES = {"iphone 13 pro max"}
+EXCLUDED_DEVICE_PRODUCT_TYPES = {"iphone14,3"}
 
 
 def _now_ts() -> float:
@@ -193,6 +195,24 @@ def _parse_devices_arg(raw: str | None) -> list[str]:
     return out
 
 
+def _normalize_model_text(text: object) -> str:
+    return re.sub(r"\s+", " ", str(text or "")).strip().lower()
+
+
+def _is_excluded_device_model(*name_like_fields: str, product_type: str = "") -> bool:
+    normalized_product = _normalize_model_text(product_type)
+    if normalized_product in EXCLUDED_DEVICE_PRODUCT_TYPES:
+        return True
+    for raw in name_like_fields:
+        normalized = _normalize_model_text(raw)
+        if not normalized:
+            continue
+        for model_name in EXCLUDED_DEVICE_MODEL_NAMES:
+            if model_name in normalized:
+                return True
+    return False
+
+
 def _discover_connected_udids_from_devicectl(only_wired: bool = True) -> list[str]:
     if shutil.which("xcrun") is None:
         return []
@@ -225,7 +245,8 @@ def _discover_connected_udids_from_devicectl(only_wired: bool = True) -> list[st
             continue
         hw = item.get("hardwareProperties") or {}
         conn = item.get("connectionProperties") or {}
-        if not isinstance(hw, dict) or not isinstance(conn, dict):
+        dev = item.get("deviceProperties") or {}
+        if not isinstance(hw, dict) or not isinstance(conn, dict) or not isinstance(dev, dict):
             continue
 
         udid = str(hw.get("udid") or "").strip()
@@ -243,6 +264,16 @@ def _discover_connected_udids_from_devicectl(only_wired: bool = True) -> list[st
 
         pairing_state = str(conn.get("pairingState") or "").strip().lower()
         if pairing_state and pairing_state != "paired":
+            continue
+
+        product_type = str(hw.get("productType") or hw.get("thinningProductType") or "").strip()
+        marketing_name = str(hw.get("marketingName") or "").strip()
+        device_name = str(dev.get("name") or "").strip()
+        if _is_excluded_device_model(
+            device_name,
+            marketing_name,
+            product_type=product_type,
+        ):
             continue
 
         transport_type = str(conn.get("transportType") or "").strip().lower()
@@ -271,6 +302,8 @@ def _discover_connected_udids_from_xctrace() -> list[str]:
             or "vision" in s
             or " - Connecting " in f" {s} "
         ):
+            continue
+        if _is_excluded_device_model(s):
             continue
         m = p.search(s)
         if m:
@@ -389,9 +422,9 @@ def cmd_discover(args: argparse.Namespace) -> int:
     udids = _discover_connected_udids(only_wired=not args.allow_network_devices)
     if not udids:
         if args.allow_network_devices:
-            print("No Appium-ready iOS devices detected.")
+            print("No Appium-ready iOS devices detected (iPhone 13 Pro Max is excluded by model policy).")
         else:
-            print("No Appium-ready wired iOS devices detected.")
+            print("No Appium-ready wired iOS devices detected (iPhone 13 Pro Max is excluded by model policy).")
         return 1
     for u in udids:
         print(u)
@@ -520,9 +553,9 @@ def cmd_start(args: argparse.Namespace) -> int:
 
     if not udids:
         if args.allow_network_devices:
-            print("No target devices. Pass --devices or connect appium-ready iOS devices.")
+            print("No target devices. Pass --devices or connect appium-ready iOS devices (iPhone 13 Pro Max excluded).")
         else:
-            print("No target devices. Pass --devices or connect wired appium-ready iOS devices.")
+            print("No target devices. Pass --devices or connect wired appium-ready iOS devices (iPhone 13 Pro Max excluded).")
         return 2
 
     reserved_appium: set[int] = set()

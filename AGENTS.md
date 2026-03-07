@@ -1,6 +1,6 @@
-# CLAUDE.md — Douyin 福袋 iOS Automation Bot
+# AGENTS.md — Douyin 福袋 iOS Automation Bot
 
-This file gives Claude Code full context on the project so it can assist effectively without re-reading the entire codebase from scratch each session.
+This file gives Codex full context on the project so it can assist effectively without re-reading the entire codebase from scratch each session.
 
 ---
 
@@ -23,7 +23,7 @@ run_ios_multi_device_manager.sh  # Shell launcher for multi-device mode
 cleanup_ios_fudai_debug.sh       # Kills stale WDA / Appium processes
 requirements_ios_fudai.txt       # pip deps
 doc/ios_douyin_fudai_automation_guide.md  # High-level human guide
-CLAUDE.md                        # This file
+AGENTS.md                        # This file
 ```
 
 ---
@@ -101,11 +101,7 @@ Popup visual reference (logical pts, 414×896):
 
 ### Task Execution
 - `pick_hits(driver, ocr, keywords, y_min_r)` — XML + OCR element finder in popup region
-- Task order: comment (`一键发表评论`) → fans-group join (3-step) → generic (`去完成`)
-- **加入粉丝团 3-step flow** (step 3 is optional — confirm dialog does not always appear):
-  1. Tap `加入粉丝团` button in the 福袋 popup
-  2. Wait 1.5s, then tap `加入粉丝团` again in the secondary popup that appears
-  3. *(Optional)* Wait 1.0s, then tap `确定/确认/确认加入/加入并关注/立即加入` in the final confirm dialog if present
+- Task order: comment (`一键发表评论`) → fans-group (`加入粉丝团`) → confirm → generic (`去完成`)
 - `KW_TASK_DONE = ["已达成", "已完成"]` — all done → skip task phase
 
 ### Draw Result & Notifications

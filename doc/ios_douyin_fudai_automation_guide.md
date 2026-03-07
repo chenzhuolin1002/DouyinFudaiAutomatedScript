@@ -95,16 +95,17 @@ SCAN → OPEN → INSPECT → TASK → WAIT_DRAW → RESULT
 
 ---
 
-## 6. 多设备管理器（不变）
+## 6. 多设备管理器
 
 `ios_multi_device_manager.py` 提供 `discover / start / status / logs / stop` 命令，
 每台设备独立 Appium 端口、WDA 端口、MJPEG 端口、日志文件。
+默认每次启动会动态发现当前连线设备，并按型号排除 `iPhone 13 Pro Max`。
 
 启动：
 ```bash
 ./run_ios_multi_device_manager.sh
-# 或指定设备：
-DEVICES="00008030-00166DC93E50802E" ./run_ios_multi_device_manager.sh
+# 或指定设备（可选）：
+DEVICES="<UDID1>,<UDID2>" ./run_ios_multi_device_manager.sh
 ```
 
 ---
