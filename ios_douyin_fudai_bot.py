@@ -141,6 +141,7 @@ KW_TASK_GENERIC   = ["去完成", "去参与", "立即参与", "参与抽奖", "
 KW_TASK_UNFINISHED = ["未达成", "未完成", "未满足"]
 KW_TASK_DONE       = ["已达成", "已完成"]   # right-side status on each completed task row
 KW_SUCCESS         = ["已参与", "参与成功", "等待开奖", "参与成功 等待开奖"]
+KW_FANS_DONE       = ["已加入粉丝团", "本场已加入", "已加入", "已达成", "已完成", "已点亮"]
 
 KW_WIN  = ["恭喜抽中", "恭喜你抽中", "恭喜你中奖了", "抽中福袋"]
 KW_LOSE = ["未中奖", "未中签", "没有抽中福袋", "很遗憾", "下次再来", "擦肩而过"]
@@ -943,20 +944,34 @@ def execute_tasks(
             tapped_this_round.append((h.x, h.y))
             time.sleep(0.35)
 
-        def _tap_row_action(h: Hit, label: str) -> None:
-            # Task action buttons are usually on the right side of the same row.
-            if h.y < int(sh * 0.35):
-                return
-            action_x = min(sw - 24, max(24, int(sw * 0.86)))
-            if any(abs(action_x - px) < 12 and abs(h.y - py) < 12 for px, py in tapped_this_round):
-                return
-            log(f"  Tap {label}-action → row@({h.x},{h.y}) action@({action_x},{h.y})")
-            tap(driver, action_x, h.y)
-            tapped_this_round.append((action_x, h.y))
-            time.sleep(0.35)
+        def _tap_task_target(
+            h: Hit,
+            label: str,
+            allow_duplicate: bool = False,
+        ) -> None:
+            # Click only the matched text/button target to avoid right-side product-entry mis-taps.
+            _tap_hit(h, label, allow_duplicate=allow_duplicate)
+
+        def _tap_overlay_dismiss_point(label: str, rounds: int = 1) -> None:
+            sw_, sh_ = screen_size(driver)
+            dismiss_x = int(sw_ * 0.5)
+            dismiss_y = max(1, min(sh_ - 1, int(sh_ * POPUP_Y_MIN) - 5))
+            for _ in range(max(1, rounds)):
+                log(f"  Tap {label} point @ ({dismiss_x},{dismiss_y})")
+                tap(driver, dismiss_x, dismiss_y)
+                time.sleep(0.35)
 
         def _close_fans_overlay_and_reopen_entry() -> bool:
             log("  Fans flow done — closing fans overlay and returning via 福袋入口.")
+            # Fans panel doesn't always contain 福袋 anchors, so force the same
+            # overlay-dismiss tap point before generic cleanup.
+            _tap_overlay_dismiss_point("fans-overlay-dismiss", rounds=2)
+            try:
+                after_force = _joined(merged_texts(driver, ocr, lower_half=True))
+            except Exception:
+                after_force = ""
+            if _contains_any(after_force, ["我的等级特权", "升级任务", "查看全部等级特权", "亲密度"]):
+                _tap_overlay_dismiss_point("fans-overlay-dismiss-retry", rounds=1)
             dismiss_overlays(driver, ocr, rounds=3)
             time.sleep(0.45)
             local_cache = EntryCache(ttl=2.0, ocr_cooldown=0.8)
@@ -979,12 +994,105 @@ def execute_tasks(
             log("  [WARN] Failed to restore 福袋 popup after fans flow.")
             return False
 
+        def _fans_task_marked_done() -> bool:
+            # Best-effort textual check: fans task row should flip to done wording.
+            try:
+                now_texts = merged_texts(driver, ocr, lower_half=True)
+            except Exception:
+                return False
+            normalized = re.sub(r"[\s|]+", "", _joined(now_texts))
+            if any(k in normalized for k in KW_FANS_DONE):
+                return True
+            if re.search(r"(加入购物粉丝团|加入粉丝团|加入粉丝).{0,8}(已达成|已完成|已加入)", normalized):
+                return True
+            if re.search(r"(已达成|已完成|已加入).{0,8}(加入购物粉丝团|加入粉丝团|加入粉丝)", normalized):
+                return True
+            return False
+
+        def _wait_fans_done(timeout_s: float = 2.8) -> bool:
+            deadline = time.time() + max(0.2, timeout_s)
+            while time.time() < deadline:
+                if _fans_task_marked_done():
+                    return True
+                time.sleep(0.35)
+            return False
+
+        def _filter_step2_hits(raw_hits: list[Hit], step1_hit: Hit) -> list[Hit]:
+            hits = [
+                x for x in raw_hits
+                if not _contains_any(x.text, ["粉丝团规则", "粉丝团权益", "购物粉丝团权益", "待解锁", "酷炫勋章"])
+            ]
+            # Step2 must not reuse the original step1 row.
+            hits = [
+                x for x in hits
+                if not (abs(x.x - step1_hit.x) < 18 and abs(x.y - step1_hit.y) < 28)
+            ]
+            preferred_step2 = [x for x in hits if "购物粉丝团" not in x.text]
+            if preferred_step2:
+                hits = preferred_step2
+            preferred_cta = [x for x in hits if x.x >= int(sw * 0.45)]
+            if preferred_cta:
+                hits = preferred_cta
+            return sorted(hits, key=lambda z: (z.y, z.x), reverse=True)
+
+        def _wait_for_stable_step2_hits(step1_hit: Hit, timeout_s: float = 6.5) -> list[Hit]:
+            deadline = time.time() + max(0.4, timeout_s)
+            stable_rounds = 0
+            last_sig = ""
+            while time.time() < deadline:
+                raw_hits = pick_hits(driver, ocr, KW_FANS_JOIN, y_min_r=0.35, max_text_len=24)
+                hits = _filter_step2_hits(raw_hits, step1_hit)
+                if hits:
+                    sig = "|".join(f"{x.text}@{x.x},{x.y}" for x in hits[:3])
+                    if sig == last_sig:
+                        stable_rounds += 1
+                    else:
+                        last_sig = sig
+                        stable_rounds = 1
+                    if stable_rounds >= 2:
+                        time.sleep(0.25)
+                        return hits
+                else:
+                    stable_rounds = 0
+                    last_sig = ""
+                time.sleep(0.3)
+            return []
+
+        def _filter_confirm_hits(raw_hits: list[Hit]) -> list[Hit]:
+            hits = [
+                x for x in raw_hits
+                if not _contains_any(x.text, ["粉丝团规则", "粉丝团权益", "购物粉丝团权益", "待解锁", "酷炫勋章", "规则", "权益"])
+            ]
+            return sorted(hits, key=lambda z: (z.y, z.x), reverse=True)
+
+        def _wait_for_stable_confirm_hits(timeout_s: float = 4.8) -> list[Hit]:
+            deadline = time.time() + max(0.4, timeout_s)
+            stable_rounds = 0
+            last_sig = ""
+            while time.time() < deadline:
+                raw_hits = pick_hits(driver, ocr, KW_FANS_CONFIRM, y_min_r=0.20, max_text_len=40)
+                hits = _filter_confirm_hits(raw_hits)
+                if hits:
+                    sig = "|".join(f"{x.text}@{x.x},{x.y}" for x in hits[:3])
+                    if sig == last_sig:
+                        stable_rounds += 1
+                    else:
+                        last_sig = sig
+                        stable_rounds = 1
+                    if stable_rounds >= 2:
+                        time.sleep(0.2)
+                        return hits
+                else:
+                    stable_rounds = 0
+                    last_sig = ""
+                time.sleep(0.3)
+            return []
+
         # 1. Comment task — search wider y range and log if missing
         comment_hits = pick_hits(driver, ocr, KW_COMMENT_TASK, y_min_r=0.35, max_text_len=12)
         if comment_hits:
             for h in comment_hits:
                 _tap_hit(h, "comment-task-label")
-                _tap_row_action(h, "comment-task")
             time.sleep(0.6)  # wait for comment to register
         else:
             log("  [WARN] Comment button not found — dumping popup texts for debug")
@@ -995,49 +1103,74 @@ def execute_tasks(
         # Step 1: click fans button on 福袋 popup task row
         # Step 2: wait for secondary fans panel and click its fans button again
         # Step 3: optional confirm popup -> click confirm
-        fans_hits = pick_hits(driver, ocr, KW_FANS_JOIN, y_min_r=0.35, max_text_len=24)
+        fans_hits = pick_hits(driver, ocr, KW_FANS_JOIN, y_min_r=0.55, max_text_len=24)
+        fans_hits = [
+            x for x in fans_hits
+            if not _contains_any(x.text, ["粉丝团规则", "粉丝团权益", "购物粉丝团权益", "待解锁", "酷炫勋章"])
+        ]
         if fans_hits:
             # Execute one deterministic fans flow per round to avoid duplicate step loops.
-            h = sorted(fans_hits, key=lambda z: (z.y, z.x))[0]
+            # Prefer lower/right candidate to hit the actual CTA instead of the left label.
+            h = sorted(fans_hits, key=lambda z: (z.y, z.x), reverse=True)[0]
             # Step 1
-            _tap_hit(h, "fans-step1")
-            _tap_row_action(h, "fans-step1")
-            time.sleep(0.4)
+            _tap_task_target(h, "fans-step1")
+            time.sleep(0.6)  # allow secondary panel animation to settle
+            fans_done = _wait_fans_done(1.4)
 
             # Step 2
             step2_done = False
-            step2_deadline = time.time() + 6.0
-            while time.time() < step2_deadline:
-                step2_hits = pick_hits(driver, ocr, KW_FANS_JOIN, y_min_r=0.20, max_text_len=24)
-                step2_hits = [
-                    x for x in step2_hits
-                    if not _contains_any(x.text, ["粉丝团规则", "粉丝团权益", "购物粉丝团权益", "待解锁", "酷炫勋章"])
-                ]
+            if not fans_done:
+                step2_hits = _wait_for_stable_step2_hits(h, timeout_s=6.5)
                 if step2_hits:
-                    c = sorted(step2_hits, key=lambda z: (z.y, z.x), reverse=True)[0]
+                    preview = ", ".join(f"{x.text}@({x.x},{x.y})/{x.src}" for x in step2_hits[:3])
+                    log(f"  fans-step2 candidates: {preview}")
+                    c = step2_hits[0]
+                    # Step2: tap the matched CTA first; only add right-side tap when needed.
                     _tap_hit(c, "fans-step2", allow_duplicate=True)
                     step2_done = True
-                    break
-                time.sleep(0.35)
-            if not step2_done:
-                log("  [WARN] fans-step2 not detected in secondary panel.")
+                    time.sleep(0.5)  # wait for optional confirm popup
+                    fans_done = _wait_fans_done(1.2)
+                else:
+                    log("  [WARN] fans-step2 not detected in secondary panel.")
 
             # Step 3 (optional)
             confirm_done = False
-            confirm_deadline = time.time() + 4.0
-            while time.time() < confirm_deadline:
-                confirm_hits = pick_hits(driver, ocr, KW_FANS_CONFIRM, y_min_r=0.20, max_text_len=28)
-                for c in sorted(confirm_hits, key=lambda z: (z.y, z.x), reverse=True):
-                    if _contains_any(c.text, ["粉丝团规则", "粉丝团权益", "购物粉丝团权益", "待解锁", "酷炫勋章", "规则", "权益"]):
-                        continue
-                    _tap_hit(c, "fans-step3-confirm", allow_duplicate=True)
+            if not fans_done:
+                confirm_hits = _wait_for_stable_confirm_hits(timeout_s=4.8)
+                if confirm_hits:
+                    c = confirm_hits[0]
+                    _tap_task_target(
+                        c,
+                        "fans-step3-confirm",
+                        allow_duplicate=True,
+                    )
                     confirm_done = True
-                    break
-                if confirm_done:
-                    break
-                time.sleep(0.3)
-            if not confirm_done:
-                log("  fans-step3-confirm not shown (optional), continue.")
+                    time.sleep(0.5)
+                    fans_done = _wait_fans_done(2.2)
+                else:
+                    log("  fans-step3-confirm not shown (optional), continue.")
+
+            # Verify fans task completion before exiting this branch.
+            if not fans_done:
+                fallback_hits = pick_hits(driver, ocr, KW_FANS_CONFIRM + KW_FANS_JOIN, y_min_r=0.30, max_text_len=40)
+                fallback_hits = [
+                    x for x in fallback_hits
+                    if not _contains_any(x.text, ["粉丝团规则", "粉丝团权益", "购物粉丝团权益", "待解锁", "酷炫勋章", "规则", "权益"])
+                ]
+                if fallback_hits:
+                    for c in sorted(fallback_hits, key=lambda z: (z.y, z.x), reverse=True)[:2]:
+                        _tap_task_target(
+                            c,
+                            "fans-fallback",
+                            allow_duplicate=True,
+                        )
+                        if _wait_fans_done(1.6):
+                            fans_done = True
+                            break
+            if fans_done:
+                log("  Fans task marked done.")
+            else:
+                log("  [WARN] Fans task still not done after step2/confirm attempts.")
 
             _close_fans_overlay_and_reopen_entry()
 
@@ -1315,51 +1448,16 @@ def room_changed(before: frozenset[str], after: frozenset[str]) -> bool:
 
 def dismiss_overlays(driver: webdriver.Remote, ocr: object, rounds: int = 3) -> int:
     closed = 0
-    w, h_ = screen_size(driver)
+    sw, sh = screen_size(driver)
+    dismiss_x = int(sw * 0.5)
+    # Use popup top edge (POPUP_Y_MIN) and move 5pt upward to avoid tapping popup content.
+    dismiss_y = max(1, min(sh - 1, int(sh * POPUP_Y_MIN) - 5))
     for _ in range(rounds):
-        # 1. Try the × close button in top-right of the 福袋 popup
-        #    On screenshot it sits at ~(683,136) on a 390×844pt screen ≈ (93%W, 16%H)
-        close_hits = scrape_elements(
-            driver,
-            types={"XCUIElementTypeButton", "XCUIElementTypeStaticText", "XCUIElementTypeOther"},
-            x_min_r=0.80, x_max_r=1.0,
-            y_min_r=0.10, y_max_r=0.25,
-        )
-        # Filter to small elements likely to be × close icons
-        x_hits = [h for h in close_hits if h.w <= 60 and h.h <= 60]
-        if x_hits:
-            best = min(x_hits, key=lambda h: h.w * h.h)  # smallest = most likely icon
-            log(f"  Tap × close button '{best.text}' @ ({best.x},{best.y})")
-            tap(driver, best.x, best.y)
-            closed += 1
-            time.sleep(0.4)
-            post = visible_texts(driver, lower_half=True)
-            if not _contains_any(_joined(post), KW_POPUP_ANCHOR):
-                break
-            continue
-
-        # 2. Try named close buttons
-        hits = scrape_elements(driver, keywords=KW_CLOSE)
-        safe = [
-            hh for hh in hits
-            if not _contains_any(hh.text, KW_RISKY_CLOSE)
-            and not (hh.x < w * 0.46 and hh.y < h_ * 0.20)
-        ]
-        if safe:
-            hh = min(safe, key=lambda x: len(x.text))
-            log(f"  Dismiss overlay '{hh.text}' @ ({hh.x},{hh.y})")
-            tap(driver, hh.x, hh.y)
-            closed += 1
-            time.sleep(0.3)
-            continue
-
-        # Check if the 福袋 popup is open; if so tap above it to dismiss
+        # Check if the 福袋 popup is open; if so use fixed safe tap point above popup.
         popup_texts = merged_texts(driver, ocr, lower_half=True)
         if _contains_any(_joined(popup_texts), KW_POPUP_ANCHOR + KW_POPULARITY):
-            sw, sh = screen_size(driver)
-            # Tap the live-stream area above the popup to collapse it
-            log("  Tap above popup to dismiss.")
-            tap(driver, int(sw * 0.5), int(sh * 0.35))
+            log(f"  Tap overlay-dismiss point @ ({dismiss_x},{dismiss_y})")
+            tap(driver, dismiss_x, dismiss_y)
             closed += 1
             time.sleep(0.35)
             # Verify popup gone
@@ -1868,20 +1966,42 @@ def main() -> int:
     if args.derived_data_path:
         wda_caps["derivedDataPath"] = args.derived_data_path
 
+    def _is_wda_bootstrap_error(err: Exception) -> bool:
+        s = str(err or "")
+        keys = [
+            "WebDriverAgent",
+            "xcodebuild failed",
+            "Could not proxy command",
+            "socket hang up",
+            "Bad Gateway",
+            "Connection refused",
+            "Max retries exceeded",
+            "Connection was refused to port",
+        ]
+        return any(k in s for k in keys)
+
     driver: Optional[webdriver.Remote] = None
-    try:
-        driver = build_driver(args.appium, args.udid, args.bundle_id, **wda_caps)
-    except Exception as e:
-        if "WebDriverAgent" in str(e) or "xcodebuild failed" in str(e):
-            log("WDA bootstrap failed — retrying with useNewWDA=true…")
-            time.sleep(2.0)
-            wda_caps["useNewWDA"] = True
-            wda_caps["wdaLaunchTimeout"]   = max(wda_caps["wdaLaunchTimeout"], 180000)
-            wda_caps["wdaConnectionTimeout"] = max(wda_caps["wdaConnectionTimeout"], 180000)
-            wda_caps["wdaStartupRetries"]  = max(3, wda_caps["wdaStartupRetries"])
+    bootstrap_attempts = 4
+    last_bootstrap_error: Optional[Exception] = None
+    for attempt in range(1, bootstrap_attempts + 1):
+        try:
             driver = build_driver(args.appium, args.udid, args.bundle_id, **wda_caps)
-        else:
-            raise
+            break
+        except Exception as e:
+            last_bootstrap_error = e
+            if (not _is_wda_bootstrap_error(e)) or attempt >= bootstrap_attempts:
+                raise
+            wait_s = min(12.0, 2.0 * attempt)
+            log(f"WDA bootstrap failed ({e.__class__.__name__}) — retry {attempt}/{bootstrap_attempts} in {wait_s:.1f}s…")
+            wda_caps["useNewWDA"] = True
+            wda_caps["wdaLaunchTimeout"] = max(int(wda_caps["wdaLaunchTimeout"]), 240000)
+            wda_caps["wdaConnectionTimeout"] = max(int(wda_caps["wdaConnectionTimeout"]), 240000)
+            wda_caps["wdaStartupRetries"] = max(6, int(wda_caps["wdaStartupRetries"]))
+            wda_caps["wdaStartupRetryInterval"] = max(35000, int(wda_caps["wdaStartupRetryInterval"]))
+            time.sleep(wait_s)
+
+    if driver is None and last_bootstrap_error is not None:
+        raise last_bootstrap_error
 
     try:
         return run_bot(driver, ocr, args)
