@@ -1051,7 +1051,8 @@ def execute_tasks(
             stable_rounds = 0
             last_sig = ""
             while time.time() < deadline:
-                raw_hits = pick_hits(driver, ocr, KW_FANS_JOIN, y_min_r=0.35, max_text_len=24)
+                # Some rooms render step2 as confirm-like CTA text (not strictly "加入粉丝团").
+                raw_hits = pick_hits(driver, ocr, KW_FANS_JOIN + KW_FANS_CONFIRM, y_min_r=0.35, max_text_len=40)
                 hits = _filter_step2_hits(raw_hits, step1_hit)
                 if hits:
                     sig = "|".join(f"{x.text}@{x.x},{x.y}" for x in hits[:3])
@@ -1139,15 +1140,42 @@ def execute_tasks(
                     # Step2: tap the matched CTA first; only add right-side tap when needed.
                     _tap_hit(c, "fans-step2", allow_duplicate=True)
                     step2_done = True
-                    time.sleep(0.5)  # wait for optional confirm popup
-                    fans_done = _wait_fans_done(1.2)
+                    time.sleep(0.7)  # wait for optional confirm popup
+                    fans_done = _wait_fans_done(1.6)
                 else:
-                    # Fallback for rooms where step2 looks almost identical to step1.
+                    # Fallback for rooms where step2 looks almost identical to step1
+                    # or uses non-join wording that escaped keyword matching.
                     log("  [WARN] fans-step2 not detected; retrying same-spot tap.")
-                    _tap_hit(h, "fans-step2-same-spot", allow_duplicate=True)
-                    step2_done = True
-                    time.sleep(0.5)
-                    fans_done = _wait_fans_done(1.2)
+                    try:
+                        probe_texts = merged_texts(driver, ocr, lower_half=True)
+                    except Exception:
+                        probe_texts = []
+                    probe_hits = [
+                        t for t in probe_texts
+                        if _contains_any(t, ["粉丝团", "加入", "确认", "开通", "点亮", "STEP2"])
+                    ]
+                    for t in probe_hits[:10]:
+                        log(f"    step2 probe text: {t!r}")
+
+                    for retry_idx in range(1, 4):
+                        _tap_hit(h, f"fans-step2-same-spot#{retry_idx}", allow_duplicate=True)
+                        step2_done = True
+                        time.sleep(0.8)
+                        if _wait_fans_done(1.6):
+                            fans_done = True
+                            break
+                        confirm_probe = _wait_for_stable_confirm_hits(timeout_s=1.8)
+                        if confirm_probe:
+                            c = confirm_probe[0]
+                            _tap_task_target(
+                                c,
+                                f"fans-step2-confirm-probe#{retry_idx}",
+                                allow_duplicate=True,
+                            )
+                            time.sleep(0.6)
+                            if _wait_fans_done(1.8):
+                                fans_done = True
+                                break
 
             # Step 3 (optional)
             confirm_done = False
@@ -1322,7 +1350,8 @@ def wait_for_result(
                 last_task_try = time.time()
 
             # Immediately probe when countdown reaches 0
-            if left <= 1:
+            # Threshold matches analyze_popup (<=2) for consistency.
+            if left <= 2:
                 if zero_since is None:
                     zero_since = time.time()
                 # Probe for win/lose for up to grace+6s
@@ -1360,7 +1389,10 @@ def wait_for_result(
                 elif now - zero_since > grace + 6.0:
                     log("  Popup frozen at 00:00 with no result — closing and re-scanning.")
                     return "expired_no_result"
-            else:
+            elif not popup_visible:
+                # Only reset the timer when the popup is truly gone, not just
+                # when frozen_zero didn't match (avoids premature timer reset on
+                # transient parse failures while the popup is still on screen).
                 zero_since = None
 
             # Heartbeat every 20s
@@ -1487,13 +1519,8 @@ def dismiss_overlays(driver: webdriver.Remote, ocr: object, rounds: int = 3) -> 
             post = visible_texts(driver, lower_half=True)
             if not _contains_any(_joined(post), KW_POPUP_ANCHOR):
                 break  # dismissed successfully
-            # Still open — try a swipe-down gesture on the popup
-            log("  Popup still open, trying swipe-down to close.")
-            driver.execute_script("mobile: dragFromToWithVelocity", {
-                "fromX": sw * 0.5, "fromY": sh * 0.65,
-                "toX":   sw * 0.5, "toY":   sh * 0.90,
-                "velocity": 800,
-            })
+            # Still open — only retry tap-above-popup in the next loop.
+            log("  Popup still open after tap-dismiss; retrying tap-dismiss.")
             time.sleep(0.4)
             continue
         break
@@ -1881,7 +1908,7 @@ def run_bot(driver: webdriver.Remote, ocr: object, args: argparse.Namespace) -> 
                 log("🎉 WIN! Stopping bot.")
                 notify_imessage(args.notify_phone, msg)
                 return 0
-            elif draw_result in ("lose", "unknown_after_countdown"):
+            elif draw_result in ("lose", "timeout"):
                 state.current_bag_round += 1
                 prize_str = f"¥{state.current_bag_ref:.0f}" if state.current_bag_ref else "未知奖品"
                 msg = (f"😔 福袋开奖结果\n"

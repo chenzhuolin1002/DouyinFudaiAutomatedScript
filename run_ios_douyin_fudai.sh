@@ -24,6 +24,7 @@ WAIT_FOR_IDLE_TIMEOUT="${WAIT_FOR_IDLE_TIMEOUT:-0.0}"
 USE_NEW_WDA="${USE_NEW_WDA:-1}"
 SHOW_XCODE_LOG="${SHOW_XCODE_LOG:-0}"
 WAIT_FOR_QUIESCENCE="${WAIT_FOR_QUIESCENCE:-0}"
+NOTIFY_PHONE="${NOTIFY_PHONE:-}"
 
 if ! command -v appium >/dev/null 2>&1; then
   echo "appium not found. Install first: npm i -g appium"
@@ -60,6 +61,9 @@ ARGS=(
 
 if [ "$USE_NEW_WDA" = "1" ]; then
   ARGS+=(--use-new-wda)
+fi
+if [ -n "$NOTIFY_PHONE" ]; then
+  ARGS+=(--notify-phone "$NOTIFY_PHONE")
 fi
 if [ "$SHOW_XCODE_LOG" = "1" ]; then
   ARGS+=(--show-xcode-log)

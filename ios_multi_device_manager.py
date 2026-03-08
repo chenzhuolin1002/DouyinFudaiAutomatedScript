@@ -283,6 +283,70 @@ def _discover_connected_udids_from_devicectl(only_wired: bool = True) -> list[st
     return sorted(set(out))
 
 
+def _discover_connected_udids_from_xcdevice(only_wired: bool = True) -> list[str]:
+    if shutil.which("xcrun") is None:
+        return []
+    try:
+        raw = subprocess.check_output(
+            ["xcrun", "xcdevice", "list"],
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=20,
+        )
+    except Exception:
+        return []
+
+    data: Any = None
+    try:
+        data = json.loads(raw)
+    except Exception:
+        # Some Xcode builds may prepend non-JSON logs; recover the JSON payload if possible.
+        start = raw.find("[")
+        end = raw.rfind("]")
+        if start < 0 or end <= start:
+            return []
+        try:
+            data = json.loads(raw[start : end + 1])
+        except Exception:
+            return []
+
+    if not isinstance(data, list):
+        return []
+
+    out: list[str] = []
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        if bool(item.get("simulator")):
+            continue
+
+        platform = _normalize_model_text(item.get("platform"))
+        if "iphoneos" not in platform and platform not in ("ios", "ipados"):
+            continue
+        if item.get("available") is False:
+            continue
+
+        udid = str(item.get("identifier") or "").strip()
+        if not udid:
+            continue
+
+        product_type = str(item.get("modelCode") or "").strip()
+        model_name = str(item.get("modelName") or "").strip()
+        device_name = str(item.get("name") or "").strip()
+        if _is_excluded_device_model(
+            device_name,
+            model_name,
+            product_type=product_type,
+        ):
+            continue
+
+        interface = _normalize_model_text(item.get("interface"))
+        if only_wired and interface not in ("usb", "wired"):
+            continue
+        out.append(udid)
+    return sorted(set(out))
+
+
 def _discover_connected_udids_from_xctrace() -> list[str]:
     cmd = ["xcrun", "xctrace", "list", "devices"]
     try:
@@ -312,9 +376,11 @@ def _discover_connected_udids_from_xctrace() -> list[str]:
 
 
 def _discover_connected_udids(only_wired: bool = True) -> list[str]:
-    udids = _discover_connected_udids_from_devicectl(only_wired=only_wired)
-    if udids:
-        return udids
+    # Prefer xcdevice: it is more reliable for mixed old/new iOS device inventories.
+    for discover in (_discover_connected_udids_from_xcdevice, _discover_connected_udids_from_devicectl):
+        udids = discover(only_wired=only_wired)
+        if udids:
+            return udids
     # Fallback for environments where devicectl metadata is unavailable.
     return _discover_connected_udids_from_xctrace()
 
@@ -384,6 +450,13 @@ def _build_bot_cmd(
         "--derived-data-path",
         str(derived_data_path),
     ]
+    cmd += [
+        "--interval-min", str(args.interval_min),
+        "--interval-max", str(args.interval_max),
+        "--room-stall-seconds", str(args.room_stall_seconds),
+    ]
+    if args.notify_phone:
+        cmd += ["--notify-phone", args.notify_phone]
     if args.allow_provisioning_updates:
         cmd.append("--allow-provisioning-updates")
     if args.allow_provisioning_device_registration:
@@ -715,8 +788,12 @@ def _build_parser() -> argparse.ArgumentParser:
     p_start.add_argument("--open-retry-before-swipe", type=int, default=4)
     p_start.add_argument("--post-swipe-wait", type=float, default=5.0)
     p_start.add_argument("--draw-countdown-grace", type=float, default=2.0)
-    p_start.add_argument("--draw-poll-interval", type=float, default=1.0)
+    p_start.add_argument("--draw-poll-interval", type=float, default=1.5)
     p_start.add_argument("--draw-result-max-wait", type=int, default=240)
+    p_start.add_argument("--interval-min", type=float, default=0.7)
+    p_start.add_argument("--interval-max", type=float, default=1.2)
+    p_start.add_argument("--room-stall-seconds", type=float, default=45.0)
+    p_start.add_argument("--notify-phone", default=None)
 
     p_start.add_argument("--wda-launch-timeout-ms", type=int, default=120000)
     p_start.add_argument("--wda-connection-timeout-ms", type=int, default=120000)
