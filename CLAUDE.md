@@ -39,7 +39,7 @@ SCAN → OPEN → INSPECT → TASK → WAIT_DRAW → RESULT → (SWITCH or loop 
 | **SCAN** | Look for 福袋 entry icon. Miss ≥2 rounds → SWITCH. Stale 00:00 popup → dismiss first. |
 | **OPEN** | Tap icon. Wait for half-screen popup. Retry up to `open_retry_before_swipe` times. |
 | **INSPECT** | Read popup. Classify as FUDAI / NONPHYSICAL / EXPIRED / LOW_VALUE. Save `ref_value` to `state.current_bag_ref`. |
-| **TASK** | Execute tasks in order: comment → fans-group join → generic buttons. |
+| **TASK** | Execute tasks: comment → fans step1/step2/optional-confirm → generic buttons. If popup disappears (`POPUP_LOST`), reopen 福袋 in same room (no unfinished-count penalty). |
 | **WAIT_DRAW** | Poll for win/lose. Detect frozen 00:00 popup and close it. Heartbeat every 20s. |
 | **RESULT** | Log result, send iMessage. WIN → exit. LOSE/timeout → SWITCH. 00:00 expired → re-scan same room. |
 | **SWITCH** | Swipe up to next live room. |
@@ -101,12 +101,11 @@ Popup visual reference (logical pts, 414×896):
 
 ### Task Execution
 - `pick_hits(driver, ocr, keywords, y_min_r)` — XML + OCR element finder in popup region
-- Task order: comment (`一键发表评论`) → fans-group join (3-step) → generic (`去完成`)
-- **加入粉丝团 3-step flow** (step 3 is optional — confirm dialog does not always appear):
-  1. Tap `加入粉丝团` button in the 福袋 popup
-  2. Wait 1.5s, then tap `加入粉丝团` again in the secondary popup that appears
-  3. *(Optional)* Wait 1.0s, then tap `确定/确认/确认加入/加入并关注/立即加入` in the final confirm dialog if present
+- Task order: comment (`一键发表评论`) → fans-group step1 (`加入粉丝团`) → step2 (`加入粉丝团`, same-spot fallback) → optional confirm (`确认加入`) → generic (`去完成`)
+- Fans step2 no longer filters by proximity to step1 coordinates (some rooms reuse almost identical text/position)
+- After fans step2/confirm, wait briefly for panel settle, then close fans overlay via top-center safe point and reopen 福袋 popup
 - `KW_TASK_DONE = ["已达成", "已完成"]` — all done → skip task phase
+- `TaskResult.POPUP_LOST` — task popup disappeared; reopen in current room instead of counting unfinished round
 
 ### Draw Result & Notifications
 - `wait_for_result(driver, ocr, ...)` — polls win/lose; detects frozen 00:00, returns `"expired_no_result"`
@@ -121,6 +120,7 @@ Popup visual reference (logical pts, 414×896):
 
 ### Overlay Dismissal
 - `dismiss_overlays(driver, ocr, rounds)` — 3-stage: (1) × button top-right, (2) named close buttons, (3) tap above popup or swipe-down
+- Fans-flow close tap uses a higher top-center point (`int(sh*POPUP_Y_MIN)-16`) to avoid tapping into popup content
 
 ---
 
@@ -182,6 +182,12 @@ Undetected countdown is `None` not `0`. Always guard `is not None` before compar
 ### 7. `dismiss_overlays` variable name collision
 `h_` used for both height and Hit object → NameError. Fixed: inner hit = `hh`, screen size = `sw, sh`.
 
+### 8. Fans step2 false-negative due to proximity filter
+Step2 button can share almost identical text/style/position with step1. Coordinate-near-step1 filtering removed; same-spot step2 fallback added.
+
+### 9. False room switch when task popup vanished
+TASK phase could count unfinished rounds even when popup was gone. Added `POPUP_LOST` flow: reopen 福袋 in current room and reset unfinished counter.
+
 ---
 
 ## Skip Conditions (SWITCH triggers)
@@ -189,7 +195,7 @@ Undetected countdown is `None` not `0`. Always guard `is not None` before compar
 - Popup kind is `NONPHYSICAL`, `EXPIRED`, or `LOW_VALUE`
 - Entry icon not found ≥2 consecutive scan rounds
 - `open_retry_before_swipe` (4) attempts all failed
-- Tasks unfinished for `max_unfinished_rounds` (3) rounds
+- Tasks unfinished for `max_unfinished_rounds` (3) rounds (`TaskResult.STILL_OPEN` only)
 - Room stalled `room_stall_seconds` (45s) with no state change
 - Draw result is LOSE or `draw_result_max_wait` (240s) exceeded
 
@@ -235,7 +241,7 @@ python3 ios_douyin_fudai_bot.py \
 | `--draw-countdown-grace` | 2.0s | Extra wait after countdown hits 0 |
 | `--draw-result-max-wait` | 240s | Max time to wait for draw result |
 | `--room-stall-seconds` | 45.0s | Switch if no state change |
-| `--max-unfinished-rounds` | 3 | Give up on tasks after N rounds |
+| `--max-unfinished-rounds` | 3 | Switch room after N `TaskResult.STILL_OPEN` rounds |
 | `--xcode-org-id` | — | Team ID for WDA provisioning |
 | `--updated-wda-bundle-id` | — | e.g. `com.see2see.livecontainer` |
 | `--use-new-wda` | false | Force fresh WDA install |
@@ -343,5 +349,6 @@ pkill -f ios_douyin_fudai_bot
 - `POPUP_Y_MIN` — too low → live-stream clock parsed as countdown
 - `_parse_countdown()` — `后开奖` anchor guard prevents live clock misread
 - `_is_prize_nonphysical()` — `粉丝团` line skip is intentional; removing it breaks diamond detection
+- fans step2 proximity filtering — intentionally removed; re-adding may miss same-style step2 buttons
 - `KW_OPEN_BLOCKLIST` — prevents result overlays being mistaken for new 福袋 entry icon
 - `notify_imessage()` recipient phone — hardcoded as `--notify-phone` arg, not in source

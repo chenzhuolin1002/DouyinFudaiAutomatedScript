@@ -27,7 +27,7 @@ SCAN → OPEN → INSPECT → TASK → WAIT_DRAW → RESULT
 | `SCAN` | 检查成功/失败信号；找 JOIN 直接按钮；找福袋入口图标 |
 | `OPEN` | 点击入口图标打开半屏弹窗 |
 | `INSPECT` | 解析弹窗类型（有效/非实物/低价/已过期）；决定下一步 |
-| `TASK` | 执行参与任务列表（评论→加粉丝团→通用按钮） |
+| `TASK` | 执行参与任务列表（评论→粉丝团 step1/step2/可选确认→通用按钮）；若弹窗丢失则同房重开福袋 |
 | `WAIT_DRAW` | 等待倒计时归零，监听开奖结果 |
 | `SWITCH` | 切换到下一直播间 |
 
@@ -59,9 +59,19 @@ SCAN → OPEN → INSPECT → TASK → WAIT_DRAW → RESULT
 
 ### 3.5 任务执行顺序明确
 ```
-评论任务 → 加入粉丝团 (含二次确认) → 通用任务按钮
+评论任务 → 加入粉丝团 step1 → 加入粉丝团 step2（同位兜底） → 可选确认 → 通用任务按钮
 ```
 每轮结束后重新读取弹窗状态，循环最多 6 轮。
+
+补充：
+- step2 不再按“与 step1 坐标接近”过滤，避免相似样式/同位置按钮被误排除。
+- step2 未识别时，会在 step1 同坐标再点击一次（`fans-step2-same-spot`）。
+- step2/确认后增加短延迟，再执行粉丝团浮层关闭与福袋弹层恢复。
+
+### 3.7 TASK 弹窗丢失保护（POPUP_LOST）
+- 若 `TASK` 阶段检测到福袋半屏弹窗消失（并复核一次仍消失），返回 `POPUP_LOST`。
+- 主循环会在**当前房间**清理后重开福袋入口，不计入未完成计数，不直接切房。
+- 只有 `TaskResult.STILL_OPEN` 才会累加 `unfinished_rounds`。
 
 ### 3.6 开奖等待简化
 - `_parse_countdown()` 只在看到 `后开奖` 锚点时才信任 `mm:ss` 格式，避免误读界面时钟。
@@ -77,12 +87,13 @@ SCAN → OPEN → INSPECT → TASK → WAIT_DRAW → RESULT
 | 福袋类型 = NONPHYSICAL (红包/抖币) | 切房 |
 | 福袋类型 = EXPIRED (倒计时=0) | 切房 |
 | 福袋类型 = LOW_VALUE (参考价值<10¥, 或>4分钟且<500¥) | 切房 |
-| 未完成任务轮次达到 `max_unfinished_rounds` | 切房 |
+| 未完成任务轮次达到 `max_unfinished_rounds`（仅 `TaskResult.STILL_OPEN`） | 切房 |
 | 开奖结果 = lose 或 unknown_after_countdown | 切房 |
 | 入口图标找不到 ≥2 轮 | 切房 |
 | OPEN 重试次数达到 `open_retry_before_swipe` | 切房 |
 | 房间停滞超过 `room_stall_seconds` | 切房 |
 | 发现封禁/结束等文案 | 切房 |
+| TASK 弹窗丢失（`POPUP_LOST`） | 不切房；同房重开福袋 |
 
 ---
 

@@ -842,6 +842,7 @@ class TaskResult(Enum):
     TASKS_DONE  = auto()  # all tasks tapped, no unfinished markers left
     STILL_OPEN  = auto()  # tasks remain, keep retrying
     EXPIRED     = auto()  # countdown hit zero mid-task
+    POPUP_LOST  = auto()  # task popup disappeared, reopen in same room
 
 
 def pick_hits(
@@ -920,6 +921,17 @@ def execute_tasks(
         texts = merged_texts(driver, ocr, lower_half=True)
         popup = analyze_popup(texts)
 
+        if popup.kind == PopupKind.NONE:
+            # Handle transient animation/frame switches: recheck once before declaring popup lost.
+            time.sleep(0.35)
+            retry_texts = merged_texts(driver, ocr, lower_half=True)
+            retry_popup = analyze_popup(retry_texts)
+            if retry_popup.kind == PopupKind.NONE:
+                log("Task: popup missing during task phase.")
+                return TaskResult.POPUP_LOST
+            texts = retry_texts
+            popup = retry_popup
+
         if popup.has_success:
             log("Task: 已参与 confirmed.")
             return TaskResult.SUCCESS
@@ -955,7 +967,8 @@ def execute_tasks(
         def _tap_overlay_dismiss_point(label: str, rounds: int = 1) -> None:
             sw_, sh_ = screen_size(driver)
             dismiss_x = int(sw_ * 0.5)
-            dismiss_y = max(1, min(sh_ - 1, int(sh_ * POPUP_Y_MIN) - 5))
+            # Fans-step2 panel has no explicit close button; use a higher point above panel top.
+            dismiss_y = max(1, min(sh_ - 1, int(sh_ * POPUP_Y_MIN) - 16))
             for _ in range(max(1, rounds)):
                 log(f"  Tap {label} point @ ({dismiss_x},{dismiss_y})")
                 tap(driver, dismiss_x, dismiss_y)
@@ -1022,11 +1035,9 @@ def execute_tasks(
                 x for x in raw_hits
                 if not _contains_any(x.text, ["粉丝团规则", "粉丝团权益", "购物粉丝团权益", "待解锁", "酷炫勋章"])
             ]
-            # Step2 must not reuse the original step1 row.
-            hits = [
-                x for x in hits
-                if not (abs(x.x - step1_hit.x) < 18 and abs(x.y - step1_hit.y) < 28)
-            ]
+            # NOTE:
+            # On some rooms/devices, step2 button keeps nearly the same text/style/position
+            # as step1. Do not filter by proximity to step1 coordinates.
             preferred_step2 = [x for x in hits if "购物粉丝团" not in x.text]
             if preferred_step2:
                 hits = preferred_step2
@@ -1131,7 +1142,12 @@ def execute_tasks(
                     time.sleep(0.5)  # wait for optional confirm popup
                     fans_done = _wait_fans_done(1.2)
                 else:
-                    log("  [WARN] fans-step2 not detected in secondary panel.")
+                    # Fallback for rooms where step2 looks almost identical to step1.
+                    log("  [WARN] fans-step2 not detected; retrying same-spot tap.")
+                    _tap_hit(h, "fans-step2-same-spot", allow_duplicate=True)
+                    step2_done = True
+                    time.sleep(0.5)
+                    fans_done = _wait_fans_done(1.2)
 
             # Step 3 (optional)
             confirm_done = False
@@ -1172,6 +1188,11 @@ def execute_tasks(
             else:
                 log("  [WARN] Fans task still not done after step2/confirm attempts.")
 
+            # Give the post-step2/confirm panel a short settle window before close taps.
+            settle_s = 1.0 if (step2_done or confirm_done) else 0.5
+            log(f"  Wait {settle_s:.1f}s before closing fans overlay.")
+            time.sleep(settle_s)
+
             _close_fans_overlay_and_reopen_entry()
 
         # 3. Generic task buttons
@@ -1189,6 +1210,8 @@ def execute_tasks(
     popup = analyze_popup(texts)
     if popup.has_success:
         return TaskResult.SUCCESS
+    if popup.kind == PopupKind.NONE:
+        return TaskResult.POPUP_LOST
     if popup.kind == PopupKind.FUDAI and not popup.has_unfinished_tasks:
         return TaskResult.TASKS_DONE
     return TaskResult.STILL_OPEN
@@ -1802,6 +1825,22 @@ def run_bot(driver: webdriver.Remote, ocr: object, args: argparse.Namespace) -> 
             if result == TaskResult.TASKS_DONE:
                 # Tasks done but no explicit success text yet — inspect again
                 state.phase = Phase.INSPECT
+                continue
+
+            if result == TaskResult.POPUP_LOST:
+                log("Task popup lost — reopening 福袋 in current room.")
+                state.unfinished_rounds = 0
+                dismiss_overlays(driver, ocr, rounds=2)
+                state.entry_cache.invalidate()
+                reopen = find_entry_icon(driver, ocr, state.entry_cache)
+                if reopen:
+                    log(f"  Re-open after popup lost ({reopen.src}) → '{reopen.text}' @ ({reopen.x},{reopen.y})")
+                    tap(driver, reopen.x, reopen.y)
+                    time.sleep(0.55)
+                    state.phase = Phase.INSPECT
+                else:
+                    log("  Entry icon not found after popup lost — back to SCAN.")
+                    state.phase = Phase.SCAN
                 continue
 
             # STILL_OPEN — tasks remain unfinished
